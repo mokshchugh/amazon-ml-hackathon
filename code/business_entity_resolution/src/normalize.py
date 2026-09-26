@@ -6,9 +6,13 @@ Cleans raw ``business_name`` strings into a set of comparable forms:
 plus the extracted ``legal`` suffix and any ``alt_name`` split out of a
 "doing business as" / "dba" name.
 
-Indic transliteration (SPEC step 3) is a later task; this module only
-flags ``was_indic`` so a transliteration pass can be inserted between
-substeps 4 and 5 without restructuring this pipeline.
+Indic transliteration (SPEC step 3): ``to_latin`` with a learned token
+table plus an ITRANS fallback.
+
+Address parsing (SPEC step 4): ``parse_address`` / ``normalize_addresses``
+split an address into postcode, house numbers, street, city and state;
+``normalize_frame`` is the single entry point that adds both the name and
+the address columns to a loaded source frame.
 """
 from __future__ import annotations
 
@@ -22,7 +26,13 @@ from typing import Mapping
 import pandas as pd
 from indic_transliteration import sanscript
 
-from lexicons import HONORIFICS, LEGAL_CANON
+from lexicons import (
+    ADDR_PREFIX_WORDS, AMBIGUOUS_ABBR, COUNTRY_ALIASES, DIRECTIONS,
+    FR_DEPT_TO_REGION, FR_REGION_ALIASES, FR_REGIONS, HONORIFICS, IN_STATES,
+    LANDMARK_WORDS, LEGAL_CANON, NON_CITY_WORDS, ORDINAL_WORDS,
+    STATE_NAMED_CITIES, STREET_ABBR, STREET_ABBR_EXTRA, STREET_WORDS,
+    US_STATES,
+)
 
 _INDIC_RANGE = re.compile(r"[ऀ-෿]")
 
@@ -78,9 +88,10 @@ def clean_text(s: str) -> str:
     """
     if s is None:
         return ""
-    s = unicodedata.normalize("NFKC", s)
-    s = unicodedata.normalize("NFKD", s)
-    s = "".join(ch for ch in s if not unicodedata.combining(ch))
+    if not s.isascii():  # ASCII is unchanged by NFKC/NFKD: skip the fold
+        s = unicodedata.normalize("NFKC", s)
+        s = unicodedata.normalize("NFKD", s)
+        s = "".join(ch for ch in s if not unicodedata.combining(ch))
     s = s.lower()
     for junk in _JUNK_LITERALS:
         s = s.replace(junk, " ")
@@ -354,3 +365,327 @@ def normalize_names(
         out[col] = out[col].astype("string[pyarrow]")
     out["was_indic"] = out["was_indic"].astype("bool")
     return out
+
+
+# ---------------------------------------------------------------------------
+# Address normalization and parsing (SPEC step 4)
+# ---------------------------------------------------------------------------
+
+_INDIC_RUN = re.compile("[%s-%s%s%s]+" % (chr(0x0900), chr(0x0DFF), chr(0x200C), chr(0x200D)))  # Indic + ZWNJ/ZWJ
+_HOUSE_NO = re.compile(r"\bh\s*\.?\s*no\b|\bhn\b")  # hn, h.no, h no -> house
+_ADDR_JUNK = re.compile(r"[^\w,/\-]|_")
+_LONE_SLASH = re.compile(r"(?<!\d)/|/(?!\d)")  # "/" kept only as in "4/1"
+_LONE_HYPHEN = re.compile(r"(?<!\w)-|-(?!\w)")  # "-" kept only inside words
+_LETTER_DIGIT_HYPHEN = re.compile(r"(?<=[a-z])-(?=\d)|(?<=\d)-(?=[a-z])")
+_NUM_TOKEN = re.compile(r"[a-z]{0,2}\d+(?:[-/]\d+)*(?:bis|ter|[a-z])?")
+_DIGIT = re.compile(r"\d")
+_ORDINAL = re.compile(r"0*(\d+)(?:st|nd|rd|th)")
+_LEADING_ZEROS = re.compile(r"^0+(?=\d)")
+_AND_WORD = re.compile(r"\band\b|\bet\b")
+_ST_WORD = re.compile(r"\bst\b")
+_STE_WORD = re.compile(r"\bste\b")
+_UNAMBIG_ABBR = {k: STREET_ABBR[k] for k in ("rd", "ave", "av", "dr", "ct", "ln", "blvd", "str")}
+_UNAMBIG_ABBR.update(STREET_ABBR_EXTRA)
+_POSTCODE_LEN = {"US": 5, "France": 5, "India": 6}
+# "Unit 12345" / "Private Road 67603" / "Box 12345": a number, not a postcode.
+_NOT_BEFORE_POSTCODE = ADDR_PREFIX_WORDS | STREET_WORDS | set(_UNAMBIG_ABBR) | {
+    "box", "pmb", "fm", "cr", "fl", "bldg", "building", "trailer", "lot", "space", "spc", "cs", "bp"}
+_ADDR_COLUMNS = ["addr_clean", "addr_tokens", "postcode", "house_nums", "street", "city", "state", "has_addr"]
+
+
+def _state_key(s: str) -> str:
+    return _NON_ALNUM.sub("", _AND_WORD.sub(" ", s))
+
+
+def _city_key(s: str) -> str:
+    return _NON_ALNUM.sub("", _STE_WORD.sub("sainte", _ST_WORD.sub("saint", s)))
+
+
+def _state_table(names: Mapping[str, str]) -> dict[str, str]:
+    return {_state_key(clean_text(k)): v for k, v in names.items() if not _INDIC_RANGE.search(k)}
+
+
+_STATE_TABLES = {
+    "US": _state_table({**US_STATES, **{c.lower(): c for c in US_STATES.values()}}),
+    "India": _state_table(IN_STATES),
+    "France": _state_table({**{r: r for r in FR_REGIONS}, **FR_REGION_ALIASES, **FR_DEPT_TO_REGION}),
+}
+_NATIVE_STATES = sorted(
+    ((unicodedata.normalize("NFC", k), v) for k, v in IN_STATES.items() if _INDIC_RANGE.search(k)),
+    key=lambda kv: -len(kv[0]),
+)
+
+
+def _canon_country(country) -> str:
+    if country is None or pd.isna(country):
+        return ""
+    return COUNTRY_ALIASES.get(str(country).strip().lower(), str(country))
+
+
+def _canon_token(t: str) -> str:
+    """"a-68" -> "a68"; ordinals "seventh" / "7st" / "7th" -> "7th"."""
+    if "-" in t:
+        t = _LETTER_DIGIT_HYPHEN.sub("", t)
+    m = _ORDINAL.fullmatch(t)
+    n = int(m.group(1)) if m else ORDINAL_WORDS.get(t)
+    if n is None:
+        return t
+    return f"{n}{'th' if 10 <= n % 100 <= 20 else {1: 'st', 2: 'nd', 3: 'rd'}.get(n % 10, 'th')}"
+
+
+def _addr_chunks(raw: str, table: Mapping[str, str] | None) -> tuple[list[list[str]], str]:
+    """Clean an address into comma chunks of tokens; also return any
+    native-script state code (R16: matched on the raw text, before the
+    NFKD fold in clean_text destroys Indic marks)."""
+    native = ""
+    if _INDIC_RANGE.search(raw):
+        raw = unicodedata.normalize("NFC", raw)
+        for name, code in _NATIVE_STATES:
+            if name in raw:
+                native = native or code
+                raw = raw.replace(name, ",")
+        if _INDIC_RANGE.search(raw):
+            raw = _INDIC_RUN.sub(lambda m: " " + to_latin(m.group(), table or {}) + " ", raw)
+    text = _HOUSE_NO.sub(" house ", clean_text(raw).replace("#", " "))
+    text = _LONE_HYPHEN.sub(" ", _LONE_SLASH.sub(" ", _ADDR_JUNK.sub(" ", text)))
+    chunks = []
+    for part in text.split(","):
+        toks = [_canon_token(t) for t in part.split()]
+        for i in range(len(toks) - 1, 0, -1):  # "5 bis" -> "5bis"
+            if toks[i] in ("bis", "ter") and toks[i - 1].isdigit():
+                toks[i - 1] += toks.pop(i)
+        if toks:
+            chunks.append(toks)
+    return chunks, native
+
+
+def _expand_abbr(toks: list[str], is_num: list[bool]) -> None:
+    """Ruling R4, in place. Lone-token chunks (state codes such as CT, FL)
+    are never expanded."""
+    n = len(toks)
+    if n < 2:
+        return
+    has_digit = any(is_num) or bool(_DIGIT.search("".join(toks)))
+    for i, t in enumerate(toks):
+        after_num = i > 0 and is_num[i - 1]
+        # "last" also covers a trailing direction or number ("Due Ave W").
+        last = i == n - 1 or is_num[i + 1] or toks[i + 1] in DIRECTIONS
+        if t in _UNAMBIG_ABBR:
+            if last or after_num:
+                toks[i] = _UNAMBIG_ABBR[t]
+        elif t == "fl":
+            toks[i] = "floor"
+        elif t in AMBIGUOUS_ABBR and has_digit:
+            # st/saint are street types only in the trailing US position.
+            if t in ("r", "bd") or last:
+                toks[i] = STREET_ABBR[t]
+
+
+def _street_of(toks: list[str], is_num: list[bool]) -> str:
+    i = 0
+    while i < len(toks) and (is_num[i] or toks[i] in ADDR_PREFIX_WORDS):
+        i += 1
+    out = []
+    for t in toks[i:]:
+        if t in LANDMARK_WORDS:
+            break
+        out.append(t)
+    return " ".join(out)
+
+
+def _partial_city(toks: list[str], idx: Mapping[str, tuple]) -> str:
+    """Longest chunk suffix, then longest chunk prefix, found in the vocab."""
+    n = len(toks)
+    for size in range(n - 1, 0, -1):
+        for sub in (toks[n - size:], toks[:size]):
+            hit = idx.get(_city_key(" ".join(sub)))
+            if hit:
+                return hit[1]
+    return ""
+
+
+def _parse(raw, country, city_idx: Mapping[str, tuple], table=None) -> tuple:
+    raw = "" if raw is None or pd.isna(raw) else str(raw)
+    cc = _canon_country(country)
+    chunks, state = _addr_chunks(raw, table)
+    nums = [[bool(_NUM_TOKEN.fullmatch(t)) for t in toks] for toks in chunks]
+
+    # Postcode: 5 digits (US/France, last token of its chunk after a word, or
+    # a lone final chunk), 6 digits (India), else the longest 4-6 digit run.
+    plen, postcode, pc_at = _POSTCODE_LEN.get(cc), "", None
+    for ci, toks in enumerate(chunks):
+        for ti, t in enumerate(toks):
+            if not t.isdigit():
+                continue
+            if plen == 6:
+                ok = len(t) == 6 and t[0] != "0"
+            elif plen == 5:
+                ok = len(t) == 5 and ti == len(toks) - 1 and (
+                    (ti > 0 and not nums[ci][ti - 1] and toks[ti - 1] not in _NOT_BEFORE_POSTCODE)
+                    or (ti == 0 and ci == len(chunks) - 1))
+            else:
+                ok = 4 <= len(t) <= 6 and len(t) >= len(postcode)
+            if ok:
+                postcode, pc_at = t, (ci, ti)
+    if pc_at:
+        nums[pc_at[0]][pc_at[1]] = False
+
+    # State (native script first, then state-only chunks, then chunks that
+    # are also a known city). City = the whole-chunk vocab hit most frequent
+    # in Source 1 (ties: the later chunk), else a partial (suffix/prefix) hit.
+    states = _STATE_TABLES.get(cc, {})
+    state_only, duals, whole = {}, [], []
+    for ci, toks in enumerate(chunks):
+        words = [t for ti, t in enumerate(toks) if (ci, ti) != pc_at]
+        text = " ".join(words)
+        if not words or _DIGIT.search(text):
+            continue
+        st, city = states.get(_state_key(text)), city_idx.get(_city_key(text))
+        if st and city:
+            duals.append((ci, st, city))
+        elif st:
+            state_only[ci] = st
+        elif city:
+            whole.append((city[0], ci, city[1]))
+    if not state and state_only:
+        state = next(iter(state_only.values()))
+    dual_state = None
+    if not state and duals:
+        dual_state, state = duals[0][0], duals[0][1]
+    whole += [(c[0], ci, c[1]) for ci, _, c in duals if ci != dual_state]
+
+    # Abbreviations, house numbers, street.
+    house_nums, street_ci, fallback_ci = [], None, None
+    for ci, toks in enumerate(chunks):
+        if ci in state_only:
+            continue
+        _expand_abbr(toks, nums[ci])
+        for ti, t in enumerate(toks):
+            if nums[ci][ti] and t[0].isdigit():
+                toks[ti] = t = _LEADING_ZEROS.sub("", t)
+            if nums[ci][ti]:
+                house_nums.append(t)
+        if any(t in STREET_WORDS for t in toks):
+            if street_ci is None or (any(nums[ci]) and not any(nums[street_ci])):
+                street_ci = ci
+        elif fallback_ci is None and _street_of(toks, nums[ci]) and any(nums[ci]):
+            fallback_ci = ci
+    sci = street_ci if street_ci is not None else fallback_ci
+    street = _street_of(chunks[sci], nums[sci]) if sci is not None else ""
+
+    city = max(whole)[2] if whole else ""
+    if not city:
+        for ci in range(len(chunks) - 1, -1, -1):
+            if ci not in state_only and ci != sci and len(chunks[ci]) > 1:
+                city = _partial_city(chunks[ci], city_idx)
+                if city:
+                    break
+    if not city and dual_state is not None:
+        city = duals[0][2][1]
+
+    tokens = []
+    for ci, toks in enumerate(chunks):
+        tokens.extend([state_only[ci].lower()] if ci in state_only else toks)
+    return (" ".join(tokens), tokens, postcode, house_nums, street, city, state, bool(tokens))
+
+
+_CITY_IDX_CACHE: dict[int, tuple] = {}
+
+
+class CitySet(set):
+    """A set of city names that also keeps each name's Source 1 count
+    (``.counts``), used to pick the most common city among candidates.
+    A plain ``set`` works too; its cities all rank equally."""
+
+    def __init__(self, counts: Mapping[str, int] = ()):
+        super().__init__(counts)
+        self.counts = dict(counts)
+
+    def __reduce__(self):  # pickle / copy keep the counts
+        return (CitySet, (self.counts,))
+
+
+def _city_index(vocab) -> dict[str, tuple[int, str]]:
+    """City-key -> (S1 count, canonical vocab entry), cached per vocab object."""
+    if not vocab:
+        return {}
+    hit = _CITY_IDX_CACHE.get(id(vocab))
+    if hit is None or hit[0] is not vocab or hit[1] != len(vocab):
+        counts = getattr(vocab, "counts", {})
+        idx: dict[str, tuple[int, str]] = {}
+        for c in sorted(vocab):
+            idx.setdefault(_city_key(c), (counts.get(c, 0), c))
+        hit = _CITY_IDX_CACHE[id(vocab)] = (vocab, len(vocab), idx)
+    return hit[2]
+
+
+def _vocab_for(city_vocab, country):
+    return city_vocab.get(country) or city_vocab.get(_canon_country(country)) or set()
+
+
+def parse_address(s: str, country: str, city_vocab: Mapping[str, set[str]],
+                  table: Mapping[str, str] | None = None) -> dict:
+    """Parse one raw address (SPEC step 4) into its comparable parts."""
+    idx = _city_index(_vocab_for(city_vocab, country))
+    return dict(zip(_ADDR_COLUMNS, _parse(s, country, idx, table)))
+
+
+def build_city_vocab(addresses: pd.Series, countries: pd.Series, min_count: int = 3) -> dict[str, set[str]]:
+    """Cities per country: digit-free comma chunks that are not a state /
+    region / departement (except STATE_NAMED_CITIES) and hold no street or
+    unit word, seen in >= ``min_count`` of the given (Source 1) addresses.
+    Spelling variants sharing a city key keep only the most frequent one.
+    Each value is a ``CitySet`` carrying the counts."""
+    pairs = pd.DataFrame({"a": addresses.to_numpy(), "c": countries.to_numpy()}).dropna()
+    counts: Counter = Counter()
+    variants: dict[tuple, Counter] = {}
+    for (addr, country), n in pairs.value_counts().items():
+        states = _STATE_TABLES.get(_canon_country(country), {})
+        seen = set()
+        for toks in _addr_chunks(addr, None)[0]:
+            text = " ".join(toks)
+            key = _city_key(text)
+            if (len(key) < 3 or key in seen or _DIGIT.search(text) or NON_CITY_WORDS.intersection(toks)
+                    or (_state_key(text) in states and text not in STATE_NAMED_CITIES)):
+                continue
+            seen.add(key)
+            counts[(country, key)] += n
+            variants.setdefault((country, key), Counter())[text] += n
+    kept: dict[str, dict[str, int]] = {}
+    for (country, key), n in counts.items():
+        if n >= min_count:
+            kept.setdefault(country, {})[variants[(country, key)].most_common(1)[0][0]] = n
+    return {country: CitySet(c) for country, c in kept.items()}
+
+
+def normalize_addresses(df: pd.DataFrame, city_vocab: Mapping[str, set[str]],
+                        table: Mapping[str, str] | None = None) -> pd.DataFrame:
+    """Return ``df`` with the parsed address columns added. Parses each
+    unique (business_address, country) pair once."""
+    idx_by_country: dict = {}
+    lookup: dict = {}
+    rows = []
+    for key in zip(df["business_address"].tolist(), df["country"].tolist()):
+        res = lookup.get(key)
+        if res is None:
+            if key[1] not in idx_by_country:
+                idx_by_country[key[1]] = _city_index(_vocab_for(city_vocab, key[1]))
+            res = lookup[key] = _parse(key[0], key[1], idx_by_country[key[1]], table)
+        rows.append(res)
+    out = df.copy()
+    cols = list(zip(*rows)) if rows else [[] for _ in _ADDR_COLUMNS]
+    for name, values in zip(_ADDR_COLUMNS, cols):
+        if name in ("addr_tokens", "house_nums"):
+            out[name] = pd.Series(list(values), index=df.index, dtype=object)
+        elif name == "has_addr":
+            out[name] = pd.Series(values, index=df.index, dtype=bool)
+        else:
+            out[name] = pd.Series(values, index=df.index, dtype="string[pyarrow]")
+    return out
+
+
+def normalize_frame(df: pd.DataFrame, token_table: Mapping[str, str],
+                    city_vocab: Mapping[str, set[str]]) -> pd.DataFrame:
+    """Single normalization entry point (R5): name columns + address columns."""
+    names = normalize_names(df["business_name"], table=token_table)
+    return normalize_addresses(pd.concat([df, names], axis=1), city_vocab, table=token_table)

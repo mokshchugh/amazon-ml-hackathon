@@ -12,14 +12,34 @@ substeps 4 and 5 without restructuring this pipeline.
 """
 from __future__ import annotations
 
+import json
 import re
 import unicodedata
+from collections import Counter
+from pathlib import Path
+from typing import Mapping
 
 import pandas as pd
+from indic_transliteration import sanscript
 
 from lexicons import HONORIFICS, LEGAL_CANON
 
 _INDIC_RANGE = re.compile(r"[ऀ-෿]")
+
+# R15 fallback: Unicode block -> indic_transliteration sanscript scheme.
+_SCRIPT_BLOCKS = [
+    (0x0900, 0x097F, sanscript.DEVANAGARI),
+    (0x0980, 0x09FF, sanscript.BENGALI),
+    (0x0A00, 0x0A7F, sanscript.GURMUKHI),
+    (0x0A80, 0x0AFF, sanscript.GUJARATI),
+    (0x0B00, 0x0B7F, sanscript.ORIYA),
+    (0x0B80, 0x0BFF, sanscript.TAMIL),
+    (0x0C00, 0x0C7F, sanscript.TELUGU),
+    (0x0C80, 0x0CFF, sanscript.KANNADA),
+    (0x0D00, 0x0D7F, sanscript.MALAYALAM),
+]
+
+_NON_ALNUM_ASCII = re.compile(r"[^a-z0-9]")
 
 # Substep 2: junk tokens/markers stripped outright.
 _JUNK_LITERALS = ("<<", "--", "##")
@@ -179,16 +199,151 @@ def normalize_name(s: str) -> dict:
 _COLUMNS = ["name_clean", "name_sorted", "name_key", "legal", "alt_name", "was_indic"]
 
 
-def normalize_names(names: pd.Series) -> pd.DataFrame:
+def _latin_tokens(s: str) -> list[str]:
+    """R14: lowercase + the R13 character-keep rule, then split on space."""
+    return _keep_letters_marks_digits(s.lower()).split()
+
+
+def _detect_script(token: str) -> str | None:
+    """R15: find the sanscript scheme for the first Indic char's block."""
+    for ch in token:
+        cp = ord(ch)
+        for lo, hi, scheme in _SCRIPT_BLOCKS:
+            if lo <= cp <= hi:
+                return scheme
+    return None
+
+
+def _fallback_transliterate(token: str) -> str:
+    """R15 fallback for an unmapped Indic token: ITRANS + phonetic squash."""
+    scheme = _detect_script(token)
+    if scheme is None:
+        return _NON_ALNUM_ASCII.sub("", token.lower())
+    itrans = sanscript.transliterate(token, scheme, sanscript.ITRANS)
+    itrans = itrans.lower()
+    itrans = itrans.replace("aa", "a")
+    itrans = re.sub(r"ee|ii", "i", itrans)
+    itrans = re.sub(r"oo|uu", "u", itrans)
+    itrans = itrans.replace("sh", "s")
+    itrans = _NON_ALNUM_ASCII.sub("", itrans)
+    return itrans
+
+
+def learn_token_table(
+    pairs: pd.DataFrame, min_count: int = 5, min_share: float = 0.8
+) -> dict[str, str]:
+    """R14: learn an (Indic token -> Latin token) mapping from GT pairs.
+
+    ``pairs`` has columns ``s23_name`` (raw) and ``s1_name`` (raw). Only
+    rows where the S2/S3 name contains Indic chars, the S1 name contains
+    none, and both have the same token count are used. Indic tokens are
+    the raw whitespace-split tokens (full sequence, legal words kept);
+    Latin tokens are lowercased and run through the R13 keep-list rule.
+    A mapping is kept when its co-occurrence count is >= ``min_count``
+    and its share of that Indic token's total alignments is >= ``min_share``.
+    """
+    counts: Counter[tuple[str, str]] = Counter()
+    totals: Counter[str] = Counter()
+
+    for s23_name, s1_name in zip(pairs["s23_name"], pairs["s1_name"]):
+        if s23_name is None or pd.isna(s23_name):
+            continue
+        if s1_name is None or pd.isna(s1_name):
+            continue
+        s23_name = str(s23_name)
+        s1_name = str(s1_name)
+        if not _INDIC_RANGE.search(s23_name) or _INDIC_RANGE.search(s1_name):
+            continue
+
+        indic_tokens = s23_name.split()
+        latin_tokens = _latin_tokens(s1_name)
+        if len(indic_tokens) != len(latin_tokens) or not indic_tokens:
+            continue
+
+        for indic_tok, latin_tok in zip(indic_tokens, latin_tokens):
+            counts[(indic_tok, latin_tok)] += 1
+            totals[indic_tok] += 1
+
+    table: dict[str, str] = {}
+    for (indic_tok, latin_tok), count in counts.items():
+        if count >= min_count and count / totals[indic_tok] >= min_share:
+            table[indic_tok] = latin_tok
+    return table
+
+
+def save_token_table(table: dict, path: Path | str | None = None) -> None:
+    """Write ``table`` as UTF-8 JSON (``ensure_ascii=False``)."""
+    if path is None:
+        import config
+
+        path = config.MODELS_DIR / "indic_tokens.json"
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(table, f, ensure_ascii=False)
+
+
+def load_token_table(path: Path | str | None = None) -> dict:
+    """Load a token table previously written by ``save_token_table``."""
+    if path is None:
+        import config
+
+        path = config.MODELS_DIR / "indic_tokens.json"
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def to_latin(s: str, table: Mapping[str, str]) -> str:
+    """Convert an Indic/Latin-mixed string to an all-Latin, lowercase string.
+
+    Each whitespace-split token is looked up in ``table`` (exact raw
+    token); an unmapped Indic token falls back to ITRANS + phonetic
+    squash (R15). Latin tokens are lowercased and pass through untouched.
+    """
+    if not s:
+        return s
+    out = []
+    for token in s.split():
+        if _INDIC_RANGE.search(token):
+            mapped = table.get(token)
+            if mapped is not None:
+                out.append(mapped.lower())
+            else:
+                out.append(_fallback_transliterate(token))
+        else:
+            out.append(token.lower())
+    return " ".join(w for w in out if w)
+
+
+def normalize_names(
+    names: pd.Series, table: Mapping[str, str] | None = None
+) -> pd.DataFrame:
     """Vectorized ``normalize_name`` over a pandas string Series.
 
     Maps over unique values only (real input has ~5M rows with heavy
     repetition), then joins the results back so the result is aligned to
-    ``names.index``.
+    ``names.index``. When ``table`` is given, ``to_latin`` is applied to
+    raw values containing Indic characters before ``normalize_name`` runs
+    (clean_text's NFKD fold would otherwise destroy Indic vowel signs and
+    viramas first); ``was_indic`` always reflects the original raw text.
     """
+
+    def _process(v):
+        if v is None or pd.isna(v):
+            raw = ""
+        else:
+            raw = v
+        was_indic = bool(_INDIC_RANGE.search(raw))
+        text = raw
+        if table is not None and was_indic:
+            text = to_latin(raw, table)
+        result = normalize_name(text)
+        result["was_indic"] = was_indic
+        return result
+
     values = names.tolist()
     unique_values = list(dict.fromkeys(values))
-    lookup = {v: normalize_name(v) for v in unique_values}
+    lookup = {v: _process(v) for v in unique_values}
 
     out = pd.DataFrame(
         [lookup[v] for v in values],

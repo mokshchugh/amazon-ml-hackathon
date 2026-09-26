@@ -387,6 +387,8 @@ _STE_WORD = re.compile(r"\bste\b")
 _UNAMBIG_ABBR = {k: STREET_ABBR[k] for k in ("rd", "ave", "av", "dr", "ct", "ln", "blvd", "str")}
 _UNAMBIG_ABBR.update(STREET_ABBR_EXTRA)
 _POSTCODE_LEN = {"US": 5, "France": 5, "India": 6}
+# Street types before abbreviation expansion (postcode rules run first).
+_STREET_ANY = STREET_WORDS | set(STREET_ABBR) | set(STREET_ABBR_EXTRA)
 # "Unit 12345" / "Private Road 67603" / "Box 12345": a number, not a postcode.
 _NOT_BEFORE_POSTCODE = ADDR_PREFIX_WORDS | STREET_WORDS | set(_UNAMBIG_ABBR) | {
     "box", "pmb", "fm", "cr", "fl", "bldg", "building", "trailer", "lot", "space", "spc", "cs", "bp"}
@@ -511,20 +513,26 @@ def _parse(raw, country, city_idx: Mapping[str, tuple], table=None) -> tuple:
     nums = [[bool(_NUM_TOKEN.fullmatch(t)) for t in toks] for toks in chunks]
 
     # Postcode: 5 digits (US/France, last token of its chunk after a word, or
-    # a lone final chunk), 6 digits (India), else the longest 4-6 digit run.
+    # a lone final chunk; France also "59000 Lille"), 6 digits (India), else
+    # (R19) the longest 4-6 digit run that is not the address's first token
+    # nor the leading number of a street chunk.
     plen, postcode, pc_at = _POSTCODE_LEN.get(cc), "", None
     for ci, toks in enumerate(chunks):
+        streety = not _STREET_ANY.isdisjoint(toks)
         for ti, t in enumerate(toks):
             if not t.isdigit():
                 continue
             if plen == 6:
                 ok = len(t) == 6 and t[0] != "0"
             elif plen == 5:
-                ok = len(t) == 5 and ti == len(toks) - 1 and (
+                ok = len(t) == 5 and ((ti == len(toks) - 1 and (
                     (ti > 0 and not nums[ci][ti - 1] and toks[ti - 1] not in _NOT_BEFORE_POSTCODE)
-                    or (ti == 0 and ci == len(chunks) - 1))
+                    or (ti == 0 and ci == len(chunks) - 1)))
+                    or (cc == "France" and ti == 0 and len(toks) > 1 and not nums[ci][1]
+                        and not t.startswith("00") and not streety))
             else:
-                ok = 4 <= len(t) <= 6 and len(t) >= len(postcode)
+                ok = (4 <= len(t) <= 6 and len(t) >= len(postcode) and (ci, ti) != (0, 0)
+                      and not (streety and ti == nums[ci].index(True)))
             if ok:
                 postcode, pc_at = t, (ci, ti)
     if pc_at:
@@ -555,7 +563,7 @@ def _parse(raw, country, city_idx: Mapping[str, tuple], table=None) -> tuple:
     whole += [(c[0], ci, c[1]) for ci, _, c in duals if ci != dual_state]
 
     # Abbreviations, house numbers, street.
-    house_nums, street_ci, fallback_ci = [], None, None
+    chunk_nums, street_ci, fallback_ci = {}, None, None
     for ci, toks in enumerate(chunks):
         if ci in state_only:
             continue
@@ -564,7 +572,7 @@ def _parse(raw, country, city_idx: Mapping[str, tuple], table=None) -> tuple:
             if nums[ci][ti] and t[0].isdigit():
                 toks[ti] = t = _LEADING_ZEROS.sub("", t)
             if nums[ci][ti]:
-                house_nums.append(t)
+                chunk_nums.setdefault(ci, []).append(t)
         if any(t in STREET_WORDS for t in toks):
             if street_ci is None or (any(nums[ci]) and not any(nums[street_ci])):
                 street_ci = ci
@@ -572,6 +580,11 @@ def _parse(raw, country, city_idx: Mapping[str, tuple], table=None) -> tuple:
             fallback_ci = ci
     sci = street_ci if street_ci is not None else fallback_ci
     street = _street_of(chunks[sci], nums[sci]) if sci is not None else ""
+    # Street chunk's numbers first (chunks get reordered), then text order.
+    house_nums = list(chunk_nums.get(sci, []))
+    for ci, found in chunk_nums.items():
+        if ci != sci:
+            house_nums.extend(found)
 
     city = max(whole)[2] if whole else ""
     if not city:

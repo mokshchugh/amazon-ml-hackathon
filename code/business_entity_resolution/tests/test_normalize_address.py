@@ -106,6 +106,34 @@ def test_city_choice_is_order_invariant_with_ranked_vocab():
         assert parse_address(raw, "India", vocab)["city"] == "mahim"  # most frequent in S1
 
 
+def test_french_postcode_before_city():  # review fix 1
+    a = parse_address("12 Rue X, 59000 LILLE, Nord", "France", V)
+    assert a["postcode"] == "59000" and a["house_nums"] == ["12"] and a["city"] == "lille"
+    # zero-padded house number before a street type is still a house number
+    b = parse_address("00262 R DE LANNOY, ROUBAIX, Nord", "France", V)
+    assert b["postcode"] == "" and b["house_nums"] == ["262"]
+
+
+def test_street_number_first_regardless_of_chunk_order():  # review fix 2
+    a = parse_address("Suite 5, 3220 Gale St, Indianapolis, IN", "US", V)
+    b = parse_address("Indianapolis, #3220 GALE ST, Suite 5, IN", "US", V)
+    assert a["house_nums"][0] == b["house_nums"][0] == "3220"
+
+
+def test_named_risk_regressions():
+    for raw in ("3220 Gale Street, Indianapolis, IN", "3220. Gale St, Indianapolis, Indiana",
+                "#3220 GALE ST, INDIANAPOLIS, IN"):
+        a = parse_address(raw, "US", V)
+        assert a["house_nums"][0] == "3220" and a["street"] == "gale street", raw
+    assert parse_address("3228 Gale St, Indianapolis, IN", "US", V)["house_nums"][0] == "3228"
+
+
+def test_unknown_country_postcode_not_house_number():  # ruling R19
+    for country in ("Atlantis", float("nan"), None):
+        a = parse_address("3220 Gale St, Somewhere", country, V)
+        assert a["postcode"] == "" and a["house_nums"] == ["3220"], country
+
+
 def test_build_city_vocab():
     addrs = pd.Series(["1 Main St, Springfield, IL"] * 3 + ["2 Oak St, Shelbyville, IL"] * 2
                       + ["Rue A, Lille, Nord"] * 3)

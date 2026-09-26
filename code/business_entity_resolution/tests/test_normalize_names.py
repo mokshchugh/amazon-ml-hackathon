@@ -16,6 +16,12 @@ from normalize import normalize_name, normalize_names, clean_text
     ("Wheel Management Pvt Ltd", "wheel management", "ltd pvt"),
     ("<< Team Ecole", "team ecole", ""),
     ("ZNB Club SARL", "znb club", "sarl"),
+    ("Surgical Health Inc.", "surgical health", "inc"),
+    ("Pvt. EFS Print Ventures Ltd.", "efs print ventures", "ltd pvt"),
+    ("Unified Keystone Cosmetics, Inc", "unified keystone cosmetics", "inc"),
+    ("Hargrove's  Tax Corp", "hargroves tax", "corp"),
+    ("Aarvansh Academy-(Limited)", "aarvansh academy", "ltd"),
+    ("Delta  Chiron LP", "delta chiron", "lp"),
 ])
 def test_normalize_name(raw, clean, legal):
     out = normalize_name(raw)
@@ -45,3 +51,12 @@ def test_name_key_glued_word_equivalence():
         == normalize_name("porternall.com")["name_key"]
         == "porternall"
     )
+
+
+def test_na_name():
+    # R13/3: pd.NA (and None) must be treated as an empty name, not crash.
+    assert normalize_name(pd.NA)["name_clean"] == ""
+
+    out = normalize_names(pd.Series(["Acme Inc", pd.NA], dtype="string[pyarrow]"))
+    assert len(out) == 2
+    assert out["name_clean"].iloc[1] == ""

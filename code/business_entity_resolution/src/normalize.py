@@ -31,6 +31,15 @@ _WHITESPACE = re.compile(r"\s+")
 _LEADING_HANDLE = re.compile(r"^[@#]+")
 _DOMAIN_SUFFIX = re.compile(r"\.(com|net|org|co|in|io|biz|info)$")
 
+# R13: the "m/s" honorific must be matched (and removed) before the
+# keep-list punctuation filter runs, since that filter would otherwise
+# split "m/s" into the two bare letters "m" and "s".
+_MS_HONORIFIC = re.compile(r"\bm/s\b")
+
+# R13: apostrophes are deleted outright (not replaced with a space), so
+# "Hargrove's" -> "hargroves", not "hargrove s".
+_APOSTROPHE = re.compile(r"['’]")
+
 # Substep 5: split a "doing business as" / "dba" name into two.
 _DBA_SPLIT = re.compile(r"\bdoing business as\b|\bdba\b")
 
@@ -76,6 +85,27 @@ def _strip_domain_and_handle(s: str) -> str:
     return s
 
 
+def _keep_letters_marks_digits(s: str) -> str:
+    """Controller ruling R13: punctuation filter run after the domain/
+    handle strip and after the "m/s" honorific is matched.
+
+    Deletes apostrophes outright, keeps any character in Unicode
+    category L*, M* or N* plus space and "&", and replaces every other
+    character with a space before collapsing whitespace. Category M is
+    kept (not just L/N) so Indic vowel signs and viramas survive this
+    step for Task 6's transliteration.
+    """
+    s = _APOSTROPHE.sub("", s)
+    kept = []
+    for ch in s:
+        if ch == " " or ch == "&" or unicodedata.category(ch)[0] in ("L", "M", "N"):
+            kept.append(ch)
+        else:
+            kept.append(" ")
+    s = "".join(kept)
+    return _WHITESPACE.sub(" ", s).strip()
+
+
 def _filter_words(words: list[str]) -> tuple[list[str], list[str]]:
     """Substeps 7-8: pull legal suffixes out, drop honorifics.
 
@@ -102,11 +132,16 @@ def _build_name_key(clean_words: list[str]) -> str:
 
 def normalize_name(s: str) -> dict:
     """Run SPEC step 2 (substeps 1-9) on one raw business name."""
-    raw = s if s is not None else ""
+    if s is None or pd.isna(s):
+        raw = ""
+    else:
+        raw = s
     was_indic = bool(_INDIC_RANGE.search(raw))
 
     text = clean_text(raw)
     text = _strip_domain_and_handle(text)
+    text = _MS_HONORIFIC.sub(" ", text)
+    text = _keep_letters_marks_digits(text)
     text = _fix_leetspeak_digits(text)
 
     match = _DBA_SPLIT.search(text)

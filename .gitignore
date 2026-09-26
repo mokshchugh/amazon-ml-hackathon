@@ -1,0 +1,17 @@
+# Large data: never commit (lives in student_resource/dataset or outside OneDrive)
+student_resource/dataset/
+output/*.tsv
+*.parquet
+*.pkl
+
+# Environments and caches
+.venv*/
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# OS / editor junk
+.DS_Store
+~$*
+Thumbs.db

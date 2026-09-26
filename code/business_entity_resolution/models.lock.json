@@ -1,0 +1,26 @@
+[
+  {
+    "role": "Embedding blocking and cross-encoder re-ranker base",
+    "repo_id": "intfloat/multilingual-e5-small",
+    "revision": "614241f622f53c4eeff9890bdc4f31cfecc418b3",
+    "license": "MIT",
+    "parameters": 117654272,
+    "status": "optional, primary"
+  },
+  {
+    "role": "Backup embedder",
+    "repo_id": "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+    "revision": "e8f8c211226b894fcb81acc59f3b34ba3efd5f42",
+    "license": "Apache-2.0",
+    "parameters": 117654272,
+    "status": "optional, backup"
+  },
+  {
+    "role": "Heavier backup (slow on a 6 GB GPU)",
+    "repo_id": "sentence-transformers/LaBSE",
+    "revision": "836121a0533e5664b21c7aacc5d22951f2b8b25b",
+    "license": "Apache-2.0",
+    "parameters": 470927360,
+    "status": "optional, last resort"
+  }
+]

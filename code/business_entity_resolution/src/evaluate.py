@@ -158,19 +158,30 @@ def report(
 
     singletons = sum(singleton_scores) / len(singleton_scores) if singleton_scores else None
 
-    # Calculate pair precision and recall
-    total_pred_pairs = sum(len(s) for s in pred.values())
-    total_true_pairs = sum(len(s) for s in truth.values())
+    # Calculate pair precision and recall (restricted to s1_country's keys)
+    total_pred_pairs = 0
+    total_true_pairs = 0
 
-    # Count overlap pairs
+    for s1_id in s1_ids:
+        pred_set = pred.get(s1_id, set())
+        truth_set = truth.get(s1_id, set())
+        total_pred_pairs += len(pred_set)
+        total_true_pairs += len(truth_set)
+
+    # Count overlap pairs (restricted to s1_country's keys)
     overlap_pairs = 0
-    for s1_id in set(pred.keys()) | set(truth.keys()):
+    for s1_id in s1_ids:
         pred_set = pred.get(s1_id, set())
         truth_set = truth.get(s1_id, set())
         overlap_pairs += len(pred_set & truth_set)
 
     pair_precision = overlap_pairs / total_pred_pairs if total_pred_pairs > 0 else 0.0
-    pair_recall_val = pair_recall(pred, truth)
+
+    # pair_recall restricted to s1_country's keys
+    if total_true_pairs == 0:
+        pair_recall_val = 1.0
+    else:
+        pair_recall_val = overlap_pairs / total_true_pairs
 
     return {
         "overall": overall,

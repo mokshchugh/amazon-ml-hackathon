@@ -11,8 +11,17 @@ import pandas as pd
 from sklearn.model_selection import train_test_split
 
 import config
+import io_utils
 
 BUCKET_ORDER = ["0", "1", "2-3", "4-5", "6+"]
+
+SPLIT_NAMES = [
+    "holdout",
+    "transfer_us_india_train",
+    "transfer_us_india_eval",
+    "transfer_india_us_train",
+    "transfer_india_us_eval",
+]
 
 
 def _bucket(count: int) -> str:
@@ -81,9 +90,15 @@ def make_holdout(
     Stratifies by country x match-count bucket (0, 1, 2-3, 4-5, 6+), folding
     strata that are too small for sklearn's stratify into a neighbouring
     bucket of the same country.
+
+    Sorts by entity_id first so the result is independent of ``s1``'s row
+    order (sklearn's stratified shuffle draws a permutation of *positions*
+    within each class, so the same input rows in a different order would
+    otherwise select different entities).
     """
-    entity_ids = s1["entity_id"].reset_index(drop=True)
-    countries = s1["country"].reset_index(drop=True)
+    s1_sorted = s1.sort_values("entity_id", kind="stable").reset_index(drop=True)
+    entity_ids = s1_sorted["entity_id"]
+    countries = s1_sorted["country"]
     counts = match_counts.reindex(entity_ids).fillna(0).astype(int).reset_index(drop=True)
     buckets = counts.map(_bucket)
 
@@ -126,3 +141,49 @@ def load_split(name: str) -> set[str]:
     path = _split_path(name)
     with open(path, "r", encoding="utf-8") as f:
         return {line.strip() for line in f if line.strip()}
+
+
+def ensure_splits(force: bool = False) -> dict[str, int]:
+    """Create (or reuse) the real-data holdout and transfer splits.
+
+    Loads the train S1 cache and ``gt_pairs.parquet`` from ``config.CACHE_DIR``,
+    builds match counts (0 for S1 records with no match), and creates and
+    saves "holdout", "transfer_us_india_train"/"_eval" and
+    "transfer_india_us_train"/"_eval".
+
+    If all five split files already exist and ``force`` is False, nothing is
+    read or (re)computed -- the existing files are left untouched and only
+    their sizes are returned. With ``force=True``, or when any file is
+    missing, all five are (re)computed and saved.
+
+    Returns a dict mapping split name -> number of entity_ids in that split.
+    """
+    paths = {name: _split_path(name) for name in SPLIT_NAMES}
+    if not force and all(p.is_file() for p in paths.values()):
+        return {name: len(load_split(name)) for name in SPLIT_NAMES}
+
+    s1 = io_utils.load("train", "source1")
+    gt = pd.read_parquet(config.CACHE_DIR / "gt_pairs.parquet")
+
+    match_counts = gt.groupby("s1_id").size()
+    match_counts = match_counts.reindex(s1["entity_id"]).fillna(0).astype(int)
+    match_counts.index = s1["entity_id"].values
+
+    holdout = make_holdout(s1, match_counts, frac=0.15, seed=config.SEED)
+    save_split(holdout, "holdout")
+
+    us_india_train, us_india_eval = transfer_split(s1, "US", "India")
+    save_split(us_india_train, "transfer_us_india_train")
+    save_split(us_india_eval, "transfer_us_india_eval")
+
+    india_us_train, india_us_eval = transfer_split(s1, "India", "US")
+    save_split(india_us_train, "transfer_india_us_train")
+    save_split(india_us_eval, "transfer_india_us_eval")
+
+    return {
+        "holdout": len(holdout),
+        "transfer_us_india_train": len(us_india_train),
+        "transfer_us_india_eval": len(us_india_eval),
+        "transfer_india_us_train": len(india_us_train),
+        "transfer_india_us_eval": len(india_us_eval),
+    }

@@ -3,7 +3,42 @@ import pandas as pd
 import pytest
 
 import config
+import io_utils
 import splits
+
+
+def _write_synthetic_cache(cache_dir, n=60, seed=3):
+    """Write a tiny train_source1.parquet + gt_pairs.parquet under cache_dir."""
+    rng = np.random.default_rng(seed)
+    countries = rng.choice(["US", "India"], size=n, p=[0.5, 0.5])
+    entity_ids = [f"S1-{i}" for i in range(n)]
+    s1 = pd.DataFrame(
+        {
+            "entity_id": pd.array(entity_ids, dtype="string[pyarrow]"),
+            "business_name": pd.array(["x"] * n, dtype="string[pyarrow]"),
+            "business_address": pd.array(["y"] * n, dtype="string[pyarrow]"),
+            "country": pd.array(countries, dtype="string[pyarrow]"),
+            "source": pd.array(["S1"] * n, dtype="string[pyarrow]"),
+        }
+    )
+    s1.to_parquet(cache_dir / "train_source1.parquet", index=False)
+
+    # Give roughly a third of records 1-3 matches each, so match_counts has
+    # some non-zero values and zero-match records too.
+    s1_out, s23_out = [], []
+    for i, entity_id in enumerate(entity_ids):
+        n_matches = rng.integers(0, 4)
+        for j in range(n_matches):
+            s1_out.append(entity_id)
+            s23_out.append(f"S2-{i}-{j}")
+    gt = pd.DataFrame(
+        {
+            "s1_id": pd.array(s1_out, dtype="string[pyarrow]"),
+            "s23_id": pd.array(s23_out, dtype="string[pyarrow]"),
+        }
+    )
+    gt.to_parquet(cache_dir / "gt_pairs.parquet", index=False)
+    return s1
 
 
 def _make_synthetic(n=10000, seed=0):
@@ -64,6 +99,16 @@ def test_save_and_load_split_roundtrip(tmp_path, monkeypatch):
     assert loaded == ids
 
 
+def test_holdout_invariant_to_row_order():
+    s1, match_counts = _make_synthetic(n=300, seed=7)
+    holdout_a = splits.make_holdout(s1, match_counts, frac=0.15, seed=42)
+
+    shuffled = s1.sample(frac=1.0, random_state=123).reset_index(drop=True)
+    holdout_b = splits.make_holdout(shuffled, match_counts, frac=0.15, seed=42)
+
+    assert holdout_a == holdout_b
+
+
 def test_make_holdout_folds_tiny_stratum_without_crashing():
     # A country with a tiny stratum (only 1 member in the "6+" bucket) that is
     # too small for train_test_split's stratify on its own; make_holdout must
@@ -82,3 +127,73 @@ def test_make_holdout_folds_tiny_stratum_without_crashing():
     assert holdout <= set(entity_ids)
     n = len(s1)
     assert abs(len(holdout) - 0.15 * n) <= 0.05 * n
+
+
+EXPECTED_SPLIT_NAMES = [
+    "holdout",
+    "transfer_us_india_train",
+    "transfer_us_india_eval",
+    "transfer_india_us_train",
+    "transfer_india_us_eval",
+]
+
+
+def test_ensure_splits_creates_five_files(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "CACHE_DIR", tmp_path)
+    s1 = _write_synthetic_cache(tmp_path)
+
+    sizes = splits.ensure_splits()
+
+    assert set(sizes.keys()) == set(EXPECTED_SPLIT_NAMES)
+    for name in EXPECTED_SPLIT_NAMES:
+        path = tmp_path / "splits" / f"{name}.txt"
+        assert path.is_file()
+        assert sizes[name] == len(splits.load_split(name))
+    assert sizes["transfer_us_india_train"] == (s1["country"] == "US").sum()
+    assert sizes["transfer_us_india_eval"] == (s1["country"] == "India").sum()
+    assert sizes["transfer_india_us_train"] == (s1["country"] == "India").sum()
+    assert sizes["transfer_india_us_eval"] == (s1["country"] == "US").sum()
+
+
+def test_ensure_splits_no_force_leaves_existing_files_unchanged(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "CACHE_DIR", tmp_path)
+    _write_synthetic_cache(tmp_path)
+
+    sizes_first = splits.ensure_splits()
+    before = {
+        name: (tmp_path / "splits" / f"{name}.txt").read_bytes()
+        for name in EXPECTED_SPLIT_NAMES
+    }
+
+    # Corrupt the source caches: if ensure_splits recomputed, it would see
+    # different data. It must not touch the files since force is False.
+    (tmp_path / "train_source1.parquet").unlink()
+
+    sizes_second = splits.ensure_splits(force=False)
+    after = {
+        name: (tmp_path / "splits" / f"{name}.txt").read_bytes()
+        for name in EXPECTED_SPLIT_NAMES
+    }
+
+    assert sizes_first == sizes_second
+    assert before == after
+
+
+def test_ensure_splits_force_true_rewrites_identically(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "CACHE_DIR", tmp_path)
+    _write_synthetic_cache(tmp_path)
+
+    sizes_first = splits.ensure_splits()
+    before = {
+        name: (tmp_path / "splits" / f"{name}.txt").read_bytes()
+        for name in EXPECTED_SPLIT_NAMES
+    }
+
+    sizes_second = splits.ensure_splits(force=True)
+    after = {
+        name: (tmp_path / "splits" / f"{name}.txt").read_bytes()
+        for name in EXPECTED_SPLIT_NAMES
+    }
+
+    assert sizes_first == sizes_second
+    assert before == after

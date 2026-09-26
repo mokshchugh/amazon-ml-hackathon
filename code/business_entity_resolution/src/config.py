@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
+CODE_DIR = REPO_ROOT / "code" / "business_entity_resolution"
 
 DATA_DIR = REPO_ROOT / "student_resource" / "dataset"
 OUTPUT_DIR = REPO_ROOT / "output"

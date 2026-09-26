@@ -29,8 +29,15 @@ BANNED = {"unidecode", "levenshtein", "python-levenshtein", "fuzzywuzzy"}
 
 # Substrings that make a license unacceptable regardless of anything else.
 # "gpl" alone catches GPL, LGPL and AGPL spellings (and classifier strings
-# such as "GNU General Public License ... (GPLv2+)").
-_BANNED_LICENSE_SUBSTRINGS = ("gpl", "sspl", "non-commercial", "noncommercial")
+# such as "GNU General Public License ... (GPLv2+)"); "general public
+# license" catches the spelled-out name when no "gpl" abbreviation appears.
+_BANNED_LICENSE_SUBSTRINGS = (
+    "gpl",
+    "general public license",
+    "sspl",
+    "non-commercial",
+    "noncommercial",
+)
 
 # Word-bounded tokens for the permissive licenses this project allows.
 _ALLOWED_LICENSE_PATTERNS = [
@@ -50,14 +57,13 @@ _ALLOWED_LICENSE_PATTERNS = [
     )
 ]
 
-REQUIREMENTS_DIR = Path(__file__).resolve().parents[1]
 CORE_REQUIREMENTS = [
-    REQUIREMENTS_DIR / "requirements.txt",
-    REQUIREMENTS_DIR / "requirements-dev.txt",
+    config.CODE_DIR / "requirements.txt",
+    config.CODE_DIR / "requirements-dev.txt",
 ]
-RERANK_REQUIREMENTS = REQUIREMENTS_DIR / "requirements-rerank.txt"
-MODELS_LOCK = REQUIREMENTS_DIR / "models.lock.json"
-REPORT_PATH = REQUIREMENTS_DIR / "THIRD_PARTY_LICENSES.md"
+RERANK_REQUIREMENTS = config.CODE_DIR / "requirements-rerank.txt"
+MODELS_LOCK = config.CODE_DIR / "models.lock.json"
+REPORT_PATH = config.CODE_DIR / "THIRD_PARTY_LICENSES.md"
 
 
 def _normalize(name: str) -> str:
@@ -74,9 +80,24 @@ def classify_license(
     trove classifiers together. The banned check runs first: any GPL,
     AGPL, LGPL, SSPL or "non-commercial" text bans the package even if an
     allowed-looking token also appears.
+
+    The free-text License field can be an entire bundled-license blob
+    (scipy ships OpenBLAS/libgfortran notices under its own License field,
+    which mention GPL/LGPL even though scipy itself is BSD). When a
+    License-Expression or a license classifier is present, that structured
+    signal is trusted and only the field's first line is used as a short
+    summary. But when there is NO expression and NO classifier — the field
+    is the only signal available — the full field is scanned, so a GPL
+    statement anywhere in it (not just line 1) still bans the package.
     """
+    has_structured_signal = bool(expression) or bool(classifiers)
+    if has_structured_signal and license_field:
+        field_for_matching = license_field.splitlines()[0]
+    else:
+        field_for_matching = license_field
+
     combined = " ".join(
-        part for part in (expression, license_field, *classifiers) if part
+        part for part in (expression, field_for_matching, *classifiers) if part
     ).lower()
 
     for banned_substring in _BANNED_LICENSE_SUBSTRINGS:
@@ -147,12 +168,10 @@ def check_licenses() -> list[str]:
         if not name:
             continue
         expression = dist.metadata.get("License-Expression", "") or ""
-        # The free-text License field can be an entire bundled-license blob
-        # (scipy ships OpenBLAS/libgfortran notices under its own License
-        # field); only the first line is a reliable, short license summary,
-        # so that's all classify_license looks at.
-        raw_license_field = dist.metadata.get("License", "") or ""
-        license_field = raw_license_field.splitlines()[0] if raw_license_field else ""
+        # Pass the full, untruncated field: classify_license decides
+        # whether truncation is safe (only when expression/classifiers
+        # already give it a structured signal to trust).
+        license_field = dist.metadata.get("License", "") or ""
         classifiers = [c for c in (dist.metadata.get_all("Classifier") or []) if "License" in c]
         verdict = classify_license(expression, license_field, classifiers)
         if verdict != "allowed":

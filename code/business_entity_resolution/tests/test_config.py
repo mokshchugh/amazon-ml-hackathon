@@ -6,3 +6,5 @@ def test_paths_and_seed(tmp_path, monkeypatch):
     assert config.CACHE_DIR == tmp_path / "w" / "cache"
     config.ensure_dirs()
     assert config.CACHE_DIR.is_dir() and config.MODELS_DIR.is_dir() and config.SUBMISSIONS_DIR.is_dir()
+    assert config.CODE_DIR == config.REPO_ROOT / "code" / "business_entity_resolution"
+    assert (config.CODE_DIR / "requirements.txt").is_file()

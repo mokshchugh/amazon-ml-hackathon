@@ -25,6 +25,12 @@ import check_env
             "banned",
         ),
         ("", "", [], "unknown"),
+        (
+            "",
+            "Some Project License\n\nThis program is free software under the GNU General Public License v3",
+            [],
+            "banned",
+        ),  # GPL statement not on line 1, no expression/classifier signal: must not escape via truncation
     ],
 )
 def test_classify_license(expr, field, cls, want):

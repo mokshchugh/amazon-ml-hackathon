@@ -586,11 +586,11 @@ Run the smoke tests and one small end-to-end pipeline run with outbound network 
 
 ### 9.5 Checklist before the first line of pipeline code
 
-- [ ] Create the venv outside OneDrive and install `requirements.txt`
-- [ ] `pip check` reports no broken requirements
-- [ ] `check_env.py` prints PASS and writes `THIRD_PARTY_LICENSES.md`
-- [ ] All smoke tests pass
-- [ ] Offline run succeeds with the network blocked
+- [x] Create the venv outside OneDrive and install `requirements.txt`
+- [x] `pip check` reports no broken requirements
+- [x] `check_env.py` prints PASS and writes `THIRD_PARTY_LICENSES.md`
+- [x] All smoke tests pass
+- [ ] Offline run succeeds with the network blocked (pending: a team member disables Wi-Fi and runs check\_env.py + smoke\_test.py)
 - [ ] Optional: install `requirements-rerank.txt`, download pinned models, and repeat the checks with the CUDA test
 
 ### 9.6 Testing strategy

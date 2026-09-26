@@ -32,11 +32,6 @@ READ_KWARGS = dict(
 )
 
 
-def _source_prefix(entity_id: str) -> str:
-    """Return the "S1"/"S2"/"S3" prefix from an entity id like "S2-123"."""
-    return entity_id.split("-", 1)[0]
-
-
 def read_source(path: Path) -> pd.DataFrame:
     """Read a source TSV (train/test source1/2/3 file).
 

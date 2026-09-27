@@ -36,9 +36,11 @@ from typing import Iterable, Mapping
 import numpy as np
 import pandas as pd
 
-GRID_MARGIN = (0.05, 0.1, 0.15, 0.2, 0.3)
-GRID_T_EMPTY = (0.3, 0.4, 0.5, 0.6, 0.7)
-GRID_T_SIB = (0.3, 0.5, 0.7)
+# v1 tuned to margin 0.3 / t_empty 0.7, both the top of the old grid, so the
+# optimum may lie beyond it: the grid now extends to the stricter side.
+GRID_MARGIN = (0.05, 0.1, 0.15, 0.2, 0.3, 0.4, 0.5)
+GRID_T_EMPTY = (0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9)
+GRID_T_SIB = (0.3, 0.5, 0.7, 0.9)
 
 # Tolerance for the owner margin comparison (0.95 - 0.8 is 0.1499999... in
 # binary floating point; it must still count as a gap of 0.15).
@@ -249,7 +251,7 @@ def decide(scored: pd.DataFrame, sib: pd.DataFrame, params: DecisionParams) -> d
 def tune_scores(scored: pd.DataFrame, sib: pd.DataFrame, truth: Mapping[str, set[str]],
                 s1_ids: Iterable[str], lone_keep: float = DecisionParams.lone_keep) -> pd.DataFrame:
     """Macro F0.5 (as ``evaluate.macro_f05`` computes it) of ``decide`` for
-    every grid point. Columns: margin, t_empty, t_sib, score (75 rows)."""
+    every grid point. Columns: margin, t_empty, t_sib, score (196 rows)."""
     prep = _Prepared(scored, sib)
     s1_ids = list(s1_ids)
     n1, n23 = len(prep.s1u), max(len(prep.s23u), 1)

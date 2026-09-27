@@ -828,6 +828,7 @@ def run_train(args, log: RunLog, slice_hook=None) -> dict:
         scored = pd.concat(scored_parts, ignore_index=True)
         del scored_parts
         log.msg(f"scored rows kept (p >= {P_FLOOR}): {len(scored)}")
+        scored.to_parquet(tag_dir / "holdout_scored.parquet", index=False)  # re-tune without re-scoring
 
     with log.stage("tune decision"):
         rep_scored = scored[scored["s1_id"].isin(report_set).to_numpy()].reset_index(drop=True)

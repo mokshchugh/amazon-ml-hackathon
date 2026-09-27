@@ -3,6 +3,7 @@
     run_all.py --split {train,test} [--limit-s1 N] [--model-tag TAG]
                [--train-sample 200000] [--max-cands-per-source K] [--baseline]
                [--out-dir DIR]
+    run_all.py --package
 
 train: cache -> splits -> normalized frames / siblings / candidates (the
     precomputed production caches in CACHE_DIR/prod are reused when present,
@@ -976,21 +977,69 @@ def log_experiment(summary: dict, path: Path = EXPERIMENTS_MD) -> None:
         f.write("\n".join(lines) + "\n")
 
 
+# ---------------------------------------------------------------------------
+# submission package (SPEC section 8 step 14)
+# ---------------------------------------------------------------------------
+
+ZIP_NAME = "Barely_Legal_submission.zip"
+DOC_NAME = "Documentation_template.md"
+_CODE_TOP_FILES = ["README.md", "requirements.txt", "requirements-rerank.txt", "requirements-dev.txt",
+                   "requirements.lock.txt", "models.lock.json", "THIRD_PARTY_LICENSES.md", "LICENSE"]
+
+
+def package(zip_path: Path | None = None, output_dir: Path | None = None,
+            doc_path: Path | None = None) -> Path:
+    """Build the submission zip: output/ TSVs, code/business_entity_resolution/
+    (src/*.py plus README, requirements, locks and licenses) and the filled
+    methodology document. No caches, models or dataset files go in."""
+    import zipfile
+
+    output_dir = Path(output_dir) if output_dir else config.OUTPUT_DIR
+    doc_path = Path(doc_path) if doc_path else config.REPO_ROOT / DOC_NAME
+    zip_path = Path(zip_path) if zip_path else config.OUTPUT_DIR / ZIP_NAME
+    entries: list[tuple[Path, str]] = []
+    for name in ("matching_results.tsv", "candidate_pairs.tsv"):
+        entries.append((output_dir / name, f"output/{name}"))
+    code_arc = "code/business_entity_resolution"
+    for f in sorted((config.CODE_DIR / "src").glob("*.py")):
+        entries.append((f, f"{code_arc}/src/{f.name}"))
+    for name in _CODE_TOP_FILES:
+        entries.append((config.CODE_DIR / name, f"{code_arc}/{name}"))
+    entries.append((doc_path, DOC_NAME))
+    missing = [str(src) for src, _ in entries if not src.is_file()]
+    if missing:
+        raise FileNotFoundError("package: missing " + ", ".join(missing))
+    zip_path.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED, allowZip64=True) as z:
+        for src, arc in entries:
+            z.write(src, arc)
+    return zip_path
+
+
 def parse_args(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("--split", choices=["train", "test"], required=True)
+    ap.add_argument("--split", choices=["train", "test"], default=None)
+    ap.add_argument("--package", action="store_true",
+                    help=f"only build OUTPUT_DIR/{ZIP_NAME} from the existing output files")
     ap.add_argument("--limit-s1", type=int, default=None)
     ap.add_argument("--model-tag", default=None)
     ap.add_argument("--train-sample", type=int, default=TRAIN_SAMPLE)
     ap.add_argument("--max-cands-per-source", type=int, default=None)
     ap.add_argument("--baseline", action="store_true")
     ap.add_argument("--out-dir", default=None)
-    return ap.parse_args(argv)
+    args = ap.parse_args(argv)
+    if args.split is None and not args.package:
+        ap.error("--split is required unless --package is given")
+    return args
 
 
 def main(argv=None, slice_hook=None) -> dict:
     args = parse_args(argv)
     config.ensure_dirs()
+    if args.package:
+        path = package()
+        print(f"PACKAGE WRITTEN {path}")
+        return {"zip": str(path)}
     log = RunLog()
     try:
         summary = (run_train if args.split == "train" else run_test)(args, log, slice_hook)

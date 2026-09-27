@@ -196,3 +196,35 @@ def test_load_cand_codes_roundtrip(tmp_path):
         assert back[c].astype(str).tolist() == df[c].astype(str).tolist(), c
     with pytest.raises(KeyError):
         run_all.load_cand_codes(path, u1, run_all.sorted_ids(df["s23_id"].iloc[:3]))
+
+
+# ---------------------------------------------------------------------------
+# submission package
+# ---------------------------------------------------------------------------
+
+def test_package_layout(tmp_path):
+    import zipfile
+
+    out = tmp_path / "output"
+    out.mkdir()
+    (out / "matching_results.tsv").write_text("source1_entity_id\tmatched_entity_ids\n", encoding="utf-8")
+    (out / "candidate_pairs.tsv").write_text("source1_entity_id\tcandidate_entity_ids\n", encoding="utf-8")
+    doc = tmp_path / "Documentation_template.md"
+    doc.write_text("# doc\n", encoding="utf-8")
+    zp = run_all.package(tmp_path / "sub.zip", output_dir=out, doc_path=doc)
+    names = set(zipfile.ZipFile(zp).namelist())
+    code = "code/business_entity_resolution/"
+    assert {"output/matching_results.tsv", "output/candidate_pairs.tsv", "Documentation_template.md"} <= names
+    assert {code + f for f in ["README.md", "requirements.txt", "models.lock.json",
+                               "THIRD_PARTY_LICENSES.md", "LICENSE", "src/run_all.py", "src/config.py"]} <= names
+    assert not any(n.endswith((".parquet", ".pkl", ".txt.model")) or "dataset/" in n or "__pycache__" in n
+                   or "/tests/" in n for n in names)
+    for n in names:
+        assert n.startswith(("output/", code)) or n == "Documentation_template.md"
+
+
+def test_package_missing_output_fails(tmp_path):
+    doc = tmp_path / "d.md"
+    doc.write_text("x", encoding="utf-8")
+    with pytest.raises(FileNotFoundError):
+        run_all.package(tmp_path / "sub.zip", output_dir=tmp_path / "nope", doc_path=doc)

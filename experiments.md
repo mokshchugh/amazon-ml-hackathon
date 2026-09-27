@@ -27,3 +27,28 @@ coverage against every Indic token in train S2+S3 `business_name` values.
 
 This table was not saved; the production table is learned inside
 `run_all.py` (Task 14) from non-holdout pairs only.
+
+## 2026-09-27 — Task 9 blocking recall gate (SPEC step 6), commit 26d548b
+
+`generate_candidates(full train S1, full train S2+S3)` with the gate script
+`.superpowers/sdd/2026-09-26-entity-resolution-v1/t9_gate.py run`; recall on
+holdout S1 (331,024 records, 1,146,208 true pairs) against the full train
+S2/S3 pool (10,320,219 records). Token table from non-holdout GT only.
+
+- **Pair recall: 0.97169 overall** (US 0.98116, India 0.95751) — target
+  0.997 **not met**
+- Reduction ratio: 0.9999908 (US 0.9999848, India 0.9999768)
+- Candidates per S1: mean 94.6, p50 111, p95 120 (per S1 per source: mean
+  47.3, p95 60)
+- Runtime 2486 s for generate_candidates; peak RSS 17.0 GiB
+- Constants: TOPN_NAME 20, MIN_COS 0.3, REVERSE_TOPN 3, KEY_MAX 200,
+  CAP_PER_SOURCE 60 (plan: 40), EMBED_ENABLED False; search-A stage-1
+  A_QUERY_K 5 / A_STAGE1_TOPN 60, A_REV_QUERY_K 8 / A_STAGE1_REV 20;
+  score weights ident 0.5, house 0.4, street 0.3, city 0.2, postcode 0.2
+- Previous attempt (run3, plan keys only, cap 40): recall 0.86969
+  (US 0.91391, India 0.80349), 52.8 candidates per S1
+- Remaining 32,449 misses: s23 empty address / name similar 11,205; same
+  city+street but crowded (name similar 4,900, very different 3,101);
+  city differs / name similar 4,597; street differs / name similar 2,484;
+  others < 1,500 each. 60% of missed pairs belong to an (S1, source) list
+  that is full at the cap.

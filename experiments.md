@@ -52,3 +52,25 @@ S2/S3 pool (10,320,219 records). Token table from non-holdout GT only.
   city differs / name similar 4,597; street differs / name similar 2,484;
   others < 1,500 each. 60% of missed pairs belong to an (S1, source) list
   that is full at the cap.
+
+## 2026-09-27 — run_all --split test tag=v1 (baseline)
+
+- 1732544 S1, 166628832 candidate pairs, 1653720 S1 with matches
+- max_cands_per_source: None
+- Stage runtimes: cache 0s, load frames 0s, load candidates 166s, baseline test 187s, write outputs 418s
+- Total 773 s; peak RSS 5.5 GB
+
+## 2026-09-27 — run_all --split train tag=v1
+
+- Holdout macro F0.5: **0.9705**; by country India 0.9595, US 0.9778; singletons 0.9661
+- Pair precision 0.9925, pair recall 0.9326; blocking recall (holdout) 0.9711
+- Baseline (top-1 if best_score >= 1.5000): holdout macro F0.5 0.6170
+- Decision params: {'margin': 0.3, 't_empty': 0.7, 't_sib': 0.7, 'lone_keep': 0.95}
+- Training: 200000 S1 sample, 18913205 rows (671469 positive), 427 rounds, 1009 s (lr 0.1, max_rounds 1500)
+- max_cands_per_source: None
+- Stage runtimes: cache+splits 3s, load frames 8s, idf/tfidf/addr_idf 36s, load candidates 150s, features (train sample) 518s, train 1017s, score eval 584s, tune decision 33s, decide + report 23s, write outputs 52s
+- Total 2444 s; peak RSS 16.3 GB
+- Notes (v1 benchmark): holdout = all 331,024 holdout S1 x their untrimmed candidates (94.6/S1); pairs with
+  p < 0.001 dropped before the decision layer (1,762,490 kept). Holdout blocking recall by
+  --max-cands-per-source K: None 0.9711, 40 0.9651, 30 0.9600, 25 0.9540, 20 0.9360. Transfer check
+  (US -> India) skipped for time.

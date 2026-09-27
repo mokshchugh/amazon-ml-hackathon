@@ -500,7 +500,7 @@ def _ensure_raw_cache(split: str) -> None:
         io_utils.build_cache("train")
 
 
-def prepare_prod(split: str, log: RunLog) -> SplitData:
+def prepare_prod(split: str, log: RunLog, ids_only: bool = False) -> SplitData:
     """Reuse CACHE_DIR/prod (R28) or compute + save it with the same choices:
     token table from non-holdout train GT (train) / all train GT (test); city
     vocab from the S1 of ``split``."""
@@ -552,6 +552,11 @@ def prepare_prod(split: str, log: RunLog) -> SplitData:
             del s1, s23
             gc.collect()
     with log.stage("load frames"):
+        if ids_only:  # --baseline: candidates alone need only ids and countries
+            s1n = _read_frame(p["source1"], ["entity_id", "country"])
+            s23n = pd.concat([_read_frame(p["source2"], ["entity_id"]), _read_frame(p["source3"], ["entity_id"])],
+                             ignore_index=True)
+            return SplitData(s1n, s23n, pd.DataFrame(), p["cands"])
         s1n = _read_frame(p["source1"], REC_COLS)
         s23n = pd.concat([_read_frame(p["source2"], REC_COLS), _read_frame(p["source3"], REC_COLS)],
                          ignore_index=True)
@@ -872,7 +877,8 @@ def run_test(args, log: RunLog, slice_hook=None) -> dict:
     tag = args.model_tag or "v1"
     with log.stage("cache"):
         _ensure_raw_cache("test")
-    data = prepare_limit("test", limit, work, log, slice_hook) if limit else prepare_prod("test", log)
+    data = (prepare_limit("test", limit, work, log, slice_hook) if limit
+            else prepare_prod("test", log, ids_only=bool(args.baseline)))
     out_dir = Path(args.out_dir) if args.out_dir else ((work / "output") if limit else config.OUTPUT_DIR)
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -921,9 +927,11 @@ def run_test(args, log: RunLog, slice_hook=None) -> dict:
             gc.collect()
         uni.cands = None
     with log.stage("write outputs"):
-        _write_candidate_file(out_dir, pieces)
         all_s1 = data.s1n["entity_id"].astype(str).tolist()
         io_utils.write_id_lists(out_dir / "matching_results.tsv", "matched_entity_ids", all_s1, matches)
+        log.msg(f"MATCHING WRITTEN {out_dir / 'matching_results.tsv'}")
+        _write_candidate_file(out_dir, pieces)
+        log.msg(f"CANDIDATES WRITTEN {out_dir / 'candidate_pairs.tsv'}")
         if data.s1_raw_for_tsv is not None:
             write_source_tsv(data.s1_raw_for_tsv, out_dir / "source1_slice.tsv")
     return {

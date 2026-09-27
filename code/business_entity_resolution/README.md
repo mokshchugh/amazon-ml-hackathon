@@ -30,3 +30,37 @@ It also regenerates `THIRD_PARTY_LICENSES.md` with `--write-report`.
 
 Run `python src/smoke_test.py` to confirm LightGBM, RapidFuzz, sparse-dot-topn
 and indic_transliteration all work end to end; it prints `SMOKE PASS`.
+
+## Reproduce both output files
+
+Put the organiser data in `student_resource/dataset/{train,test}/` (the
+`.tsv` files as downloaded). Set `ER_WORK_DIR` to a folder outside any synced drive
+for the parquet caches and models (the default is `C:\Users\utkar\er_work`).
+From the project root, with the venv active:
+
+```
+python code/business_entity_resolution/src/check_env.py
+python code/business_entity_resolution/src/run_all.py --split train --model-tag v1
+python code/business_entity_resolution/src/run_all.py --split test --model-tag v1
+cd student_resource
+python utils/validate_submission.py --matching ../output/matching_results.tsv --candidate ../output/candidate_pairs.tsv --test-dir dataset/test
+cd ..
+python code/business_entity_resolution/src/run_all.py --package
+```
+
+- `--split train` builds the caches, blocks candidates, trains LightGBM on
+  200,000 non-holdout S1 records, tunes the decision layer on the holdout and
+  saves the model to `ER_WORK_DIR/models/v1`. Measured on the team laptop
+  (16 cores, 23.7 GB RAM): 2,444 s in total (features 518 s, training
+  1,017 s, holdout scoring 584 s, other stages under 3 minutes), peak RSS
+  16.3 GB, once the blocking caches exist. Building the blocking caches for the
+  full train pool took 2,486 s on its own (peak RSS 17.0 GB).
+- `--split test` writes `output/candidate_pairs.tsv` and
+  `output/matching_results.tsv` (every test S1 id present).
+  `--max-cands-per-source K` trims candidates for speed. `--baseline` writes
+  the candidates-only insurance submission instead (773 s in total).
+- `--package` builds `output/Barely_Legal_submission.zip` with the two output
+  files, this folder's `src/`, README, requirements, locks and licenses, and the
+  filled `Documentation_template.md` from the project root.
+
+Every run appends its stage timings to `experiments.md`.

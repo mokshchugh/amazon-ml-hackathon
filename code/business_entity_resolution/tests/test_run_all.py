@@ -196,3 +196,87 @@ def test_load_cand_codes_roundtrip(tmp_path):
         assert back[c].astype(str).tolist() == df[c].astype(str).tolist(), c
     with pytest.raises(KeyError):
         run_all.load_cand_codes(path, u1, run_all.sorted_ids(df["s23_id"].iloc[:3]))
+
+
+# ---------------------------------------------------------------------------
+# submission package
+# ---------------------------------------------------------------------------
+
+def test_package_layout(tmp_path):
+    import zipfile
+
+    out = tmp_path / "output"
+    out.mkdir()
+    (out / "matching_results.tsv").write_text("source1_entity_id\tmatched_entity_ids\n", encoding="utf-8")
+    (out / "candidate_pairs.tsv").write_text("source1_entity_id\tcandidate_entity_ids\n", encoding="utf-8")
+    doc = tmp_path / "Documentation_template.md"
+    doc.write_text("# doc\n", encoding="utf-8")
+    zp = run_all.package(tmp_path / "sub.zip", output_dir=out, doc_path=doc)
+    names = set(zipfile.ZipFile(zp).namelist())
+    code = "code/business_entity_resolution/"
+    assert {"output/matching_results.tsv", "output/candidate_pairs.tsv", "Documentation_template.md"} <= names
+    assert {code + f for f in ["README.md", "requirements.txt", "models.lock.json",
+                               "THIRD_PARTY_LICENSES.md", "LICENSE", "src/run_all.py", "src/config.py"]} <= names
+    assert not any(n.endswith((".parquet", ".pkl", ".txt.model")) or "dataset/" in n or "__pycache__" in n
+                   or "/tests/" in n for n in names)
+    for n in names:
+        assert n.startswith(("output/", code)) or n == "Documentation_template.md"
+
+
+def test_package_missing_output_fails(tmp_path):
+    doc = tmp_path / "d.md"
+    doc.write_text("x", encoding="utf-8")
+    with pytest.raises(FileNotFoundError):
+        run_all.package(tmp_path / "sub.zip", output_dir=tmp_path / "nope", doc_path=doc)
+
+
+# ---------------------------------------------------------------------------
+# per-country decision params
+# ---------------------------------------------------------------------------
+
+def _two_country_case():
+    from test_decide import _random_case, _truth_for
+
+    parts, sibs, truth, s1_country = [], [], {}, {}
+    for k, country in enumerate(["US", "India"]):
+        scored, sib = _random_case(k + 1)
+        scored = scored.assign(s1_id=country + "-" + scored.s1_id, s23_id=country + "-" + scored.s23_id)
+        sib = sib.assign(entity_id=country + "-" + sib.entity_id, sib_group_id=sib.sib_group_id + 10_000 * k)
+        parts.append(scored)
+        sibs.append(sib)
+        truth.update(_truth_for(scored, k + 1))
+        s1_country.update({s: country for s in scored.s1_id})
+    return pd.concat(parts, ignore_index=True), pd.concat(sibs, ignore_index=True), truth, s1_country
+
+
+def test_tune_and_decide_by_country_match_single_country_runs():
+    import decide
+
+    scored, sib, truth, s1_country = _two_country_case()
+    ids = sorted(s1_country)
+    by_country, default = run_all.tune_by_country(scored, sib, truth, ids, s1_country)
+    assert set(by_country) == {"US", "India"}
+    assert default == decide.conservative(by_country.values())
+    for country, params in by_country.items():
+        ids_c = [s for s in ids if s1_country[s] == country]
+        sc = scored[scored.s1_id.isin(ids_c)].reset_index(drop=True)
+        assert params == decide.tune(sc, sib, truth, ids_c)
+    got = run_all.decide_by_country(scored, sib, s1_country, by_country, default)
+    want = {}
+    for country, params in by_country.items():
+        sc = scored[scored.s1_id.map(s1_country) == country].reset_index(drop=True)
+        want.update(decide.decide(sc, sib, params))
+    assert got == want
+
+
+def test_load_decision_params_flat_and_per_country():
+    import decide
+
+    flat = '{"margin": 0.3, "t_empty": 0.7, "t_sib": 0.7, "lone_keep": 0.95}'
+    by_country, default = run_all.load_decision_params(flat)
+    assert by_country == {} and default == decide.DecisionParams(0.3, 0.7, 0.7, 0.95)
+    us, india = decide.DecisionParams(0.2, 0.6, 0.5, 0.95), decide.DecisionParams(0.4, 0.8, 0.7, 0.95)
+    text = run_all._params_json({"US": us, "India": india}, decide.conservative([us, india]))
+    by_country, default = run_all.load_decision_params(text)
+    assert by_country == {"US": us, "India": india}
+    assert default == decide.DecisionParams(0.4, 0.8, 0.7, 0.95)

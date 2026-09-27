@@ -233,7 +233,7 @@ def test_tune_scores_match_macro_f05():
     s1_ids = sorted(set(scored.s1_id)) + ["NOCAND1", "NOCAND2"]
     truth["NOCAND2"] = {"zzz"}                  # true match never reached the candidates
     grid = tune_scores(scored, sib, truth, s1_ids)
-    assert len(grid) == 75
+    assert len(grid) == 196
     for row in grid.itertuples():
         params = DecisionParams(margin=row.margin, t_empty=row.t_empty, t_sib=row.t_sib)
         want = macro_f05({k: set(v) for k, v in decide(scored, sib, params).items()}, truth, s1_ids)
@@ -244,31 +244,44 @@ def test_tune_returns_best_grid_point():
     scored, sib = _random_case(8)
     truth = _truth_for(scored, 8)
     s1_ids = sorted(set(scored.s1_id))
-    grid = tune_scores(scored, sib, truth, s1_ids)
+    from decide import GRID_LONE_KEEP
+
+    grids = {lk: tune_scores(scored, sib, truth, s1_ids, lone_keep=lk) for lk in GRID_LONE_KEEP}
     best = tune(scored, sib, truth, s1_ids)
     assert isinstance(best, DecisionParams)
-    assert best.lone_keep == 0.95
+    assert best.lone_keep in GRID_LONE_KEEP
+    grid = grids[best.lone_keep]
     hit = grid[(grid.margin == best.margin) & (grid.t_empty == best.t_empty) & (grid.t_sib == best.t_sib)]
-    assert hit.score.iloc[0] == pytest.approx(grid.score.max(), abs=1e-12)
+    assert hit.score.iloc[0] == pytest.approx(max(g.score.max() for g in grids.values()), abs=1e-12)
 
 
 def test_tune_ties_prefer_defaults():
     # every grid point scores 1.0 -> the defaults win
     scored = pd.DataFrame({"s1_id": ["A"], "s23_id": ["x"], "p": [0.99]})
     best = tune(scored, EMPTY_SIB, {"A": {"x"}}, ["A"])
-    assert (best.margin, best.t_empty, best.t_sib) == (0.15, 0.5, 0.5)
+    assert (best.margin, best.t_empty, best.t_sib, best.lone_keep) == (0.15, 0.5, 0.5, 0.95)
 
 
 def test_tune_grid_values():
     scored = pd.DataFrame({"s1_id": ["A"], "s23_id": ["x"], "p": [0.99]})
     grid = tune_scores(scored, EMPTY_SIB, {"A": {"x"}}, ["A"])
-    assert sorted(set(grid.margin)) == [0.05, 0.1, 0.15, 0.2, 0.3]
-    assert sorted(set(grid.t_empty)) == [0.3, 0.4, 0.5, 0.6, 0.7]
-    assert sorted(set(grid.t_sib)) == [0.3, 0.5, 0.7]
-    assert len(set(zip(grid.margin, grid.t_empty, grid.t_sib))) == 75
+    assert sorted(set(grid.margin)) == [0.05, 0.1, 0.15, 0.2, 0.3, 0.4, 0.5]
+    assert sorted(set(grid.t_empty)) == [0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
+    assert sorted(set(grid.t_sib)) == [0.3, 0.5, 0.7, 0.9]
+    assert len(set(zip(grid.margin, grid.t_empty, grid.t_sib))) == 196
 
 
 def test_missing_ids_rejected():
     scored = pd.DataFrame({"s1_id": ["A", None], "s23_id": ["x", "y"], "p": [0.9, 0.9]})
     with pytest.raises(ValueError):
         decide(scored, EMPTY_SIB, DecisionParams())
+
+
+def test_conservative_is_fieldwise_max():
+    from decide import conservative
+
+    a = DecisionParams(margin=0.1, t_empty=0.8, t_sib=0.3, lone_keep=0.95)
+    b = DecisionParams(margin=0.3, t_empty=0.5, t_sib=0.7, lone_keep=0.9)
+    assert conservative([a, b]) == DecisionParams(margin=0.3, t_empty=0.8, t_sib=0.7, lone_keep=0.95)
+    assert conservative([a]) == a
+    assert conservative([]) == DecisionParams()

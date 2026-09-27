@@ -36,9 +36,12 @@ from typing import Iterable, Mapping
 import numpy as np
 import pandas as pd
 
-GRID_MARGIN = (0.05, 0.1, 0.15, 0.2, 0.3)
-GRID_T_EMPTY = (0.3, 0.4, 0.5, 0.6, 0.7)
-GRID_T_SIB = (0.3, 0.5, 0.7)
+# v1 tuned to margin 0.3 / t_empty 0.7, both the top of the old grid, so the
+# optimum may lie beyond it: the grid now extends to the stricter side.
+GRID_MARGIN = (0.05, 0.1, 0.15, 0.2, 0.3, 0.4, 0.5)
+GRID_T_EMPTY = (0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9)
+GRID_T_SIB = (0.3, 0.5, 0.7, 0.9)
+GRID_LONE_KEEP = (0.9, 0.95, 0.99)
 
 # Tolerance for the owner margin comparison (0.95 - 0.8 is 0.1499999... in
 # binary floating point; it must still count as a gap of 0.15).
@@ -249,7 +252,7 @@ def decide(scored: pd.DataFrame, sib: pd.DataFrame, params: DecisionParams) -> d
 def tune_scores(scored: pd.DataFrame, sib: pd.DataFrame, truth: Mapping[str, set[str]],
                 s1_ids: Iterable[str], lone_keep: float = DecisionParams.lone_keep) -> pd.DataFrame:
     """Macro F0.5 (as ``evaluate.macro_f05`` computes it) of ``decide`` for
-    every grid point. Columns: margin, t_empty, t_sib, score (75 rows)."""
+    every grid point. Columns: margin, t_empty, t_sib, score (196 rows)."""
     prep = _Prepared(scored, sib)
     s1_ids = list(s1_ids)
     n1, n23 = len(prep.s1u), max(len(prep.s23u), 1)
@@ -298,16 +301,30 @@ def tune_scores(scored: pd.DataFrame, sib: pd.DataFrame, truth: Mapping[str, set
     return pd.DataFrame(rows, columns=["margin", "t_empty", "t_sib", "score"])
 
 
+def conservative(params: Iterable[DecisionParams]) -> DecisionParams:
+    """The strictest of several settings, field by field (larger margin,
+    t_empty, t_sib and lone_keep all predict less). Used for countries the
+    holdout does not contain (SPEC 7.3: France gets the conservative value)."""
+    ps = list(params)
+    if not ps:
+        return DecisionParams()
+    return DecisionParams(margin=max(p.margin for p in ps), t_empty=max(p.t_empty for p in ps),
+                          t_sib=max(p.t_sib for p in ps), lone_keep=max(p.lone_keep for p in ps))
+
+
 def tune(scored: pd.DataFrame, sib: pd.DataFrame, truth: Mapping[str, set[str]],
          s1_ids: Iterable[str]) -> DecisionParams:
-    """Grid-search margin x t_empty x t_sib for the best macro F0.5; ties go to
-    the grid point closest (Euclidean) to the defaults, then grid order."""
-    grid = tune_scores(scored, sib, truth, s1_ids)
+    """Grid-search margin x t_empty x t_sib x lone_keep for the best macro F0.5;
+    ties go to the grid point closest (Euclidean) to the defaults, then grid
+    order."""
+    s1_ids = list(s1_ids)
+    grid = pd.concat([tune_scores(scored, sib, truth, s1_ids, lone_keep=lk).assign(lone_keep=lk)
+                      for lk in GRID_LONE_KEEP], ignore_index=True)
     d = DecisionParams()
     dist = np.sqrt((grid.margin - d.margin) ** 2 + (grid.t_empty - d.t_empty) ** 2
-                   + (grid.t_sib - d.t_sib) ** 2)
+                   + (grid.t_sib - d.t_sib) ** 2 + (grid.lone_keep - d.lone_keep) ** 2)
     best = grid.score >= grid.score.max() - _TIE_EPS
     cand = grid[best].assign(dist=dist[best]).sort_values("dist", kind="stable")
     r = cand.iloc[0]
     return DecisionParams(margin=float(r.margin), t_empty=float(r.t_empty), t_sib=float(r.t_sib),
-                          lone_keep=d.lone_keep)
+                          lone_keep=float(r.lone_keep))

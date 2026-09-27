@@ -257,15 +257,24 @@ def tune_baseline_threshold(top1: pd.DataFrame, truth: Mapping[str, set[str]],
 # Candidate tables as int codes
 # ---------------------------------------------------------------------------
 
+def _large_str(values) -> pa.Array:
+    """large_string arrow array; arrow inputs converted without a Python round trip."""
+    if isinstance(values, pa.ChunkedArray):
+        values = values.combine_chunks()
+    if isinstance(values, pa.Array) and (pa.types.is_string(values.type) or pa.types.is_large_string(values.type)):
+        return pc.fill_null(values.cast(pa.large_string()), "")
+    return features._str_array(values)
+
+
 def sorted_ids(values) -> pa.Array:
     """Unique ids, sorted (large_string)."""
-    arr = pc.unique(features._str_array(values))
+    arr = pc.unique(_large_str(values))
     return arr.take(pc.sort_indices(arr))
 
 
 def _codes_in(values, universe: pa.Array, missing_ok: bool = False) -> np.ndarray:
     """Position of each value in ``universe`` (-1 if absent, KeyError unless ``missing_ok``)."""
-    idx = pc.index_in(features._str_array(values), value_set=universe)
+    idx = pc.index_in(_large_str(values), value_set=universe)
     if idx.null_count and not missing_ok:
         raise KeyError(f"{idx.null_count} candidate ids not found in the record frames")
     return np.asarray(idx.fill_null(-1), dtype=np.int32)
@@ -314,13 +323,27 @@ class CandCodes:
                    df["search_mask"].to_numpy(), df["best_score"].to_numpy())
 
 
-def load_cand_codes(path: Path, u1: pa.Array, u23: pa.Array, batch_rows: int = 8_000_000) -> CandCodes:
-    """Stream the candidate parquet into codes (one pass, bounded memory)."""
-    parts = []
-    for batch in pq.ParquetFile(path).iter_batches(batch_size=batch_rows, columns=CAND_COLS):
-        parts.append((_codes_in(batch.column("s1_id"), u1), _codes_in(batch.column("s23_id"), u23),
-                      np.asarray(pc.equal(features._str_array(batch.column("source")), "S3")),
-                      batch.column("search_mask").to_numpy(), batch.column("best_score").to_numpy()))
+def load_cand_codes(path: Path, u1: pa.Array, u23: pa.Array, batch_rows: int = 20_000_000) -> CandCodes:
+    """Stream the candidate parquet into codes (one pass, bounded memory).
+    Parquet batches are pooled into blocks of ~``batch_rows`` rows, because
+    each ``index_in`` call rebuilds the hash of the (10M-id) value set."""
+    parts, pending, n_pending = [], [], 0
+
+    def flush():
+        tbl = pa.Table.from_batches(pending).combine_chunks()
+        parts.append((_codes_in(tbl.column("s1_id"), u1), _codes_in(tbl.column("s23_id"), u23),
+                      np.asarray(pc.equal(_large_str(tbl.column("source")), "S3")),
+                      tbl.column("search_mask").to_numpy(), tbl.column("best_score").to_numpy()))
+        pending.clear()
+
+    for batch in pq.ParquetFile(path).iter_batches(batch_size=min(batch_rows, 2_000_000), columns=CAND_COLS):
+        pending.append(batch)
+        n_pending += batch.num_rows
+        if n_pending >= batch_rows:
+            flush()
+            n_pending = 0
+    if pending:
+        flush()
     if not parts:
         return CandCodes(u1, u23, np.zeros(0, np.int32), np.zeros(0, np.int32), np.zeros(0, bool),
                          np.zeros(0, np.int8), np.zeros(0, np.float32))

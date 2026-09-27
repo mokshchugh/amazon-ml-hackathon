@@ -107,6 +107,36 @@ def test_large_identical_address_group_skips_fuzzy_link():
     assert out["sib_group_id"].nunique() == n
 
 
+def test_leader_clustering_does_not_chain_through_a_middle_record():
+    # R25: deterministic leader clustering, not representative single-
+    # linkage. Same address, five records, entity_id order matters:
+    #   e1 "alpha traders"            -> becomes leader 1
+    #   e2 "alpha trader"             -> matches leader 1 (fuzz 96) -> joins it
+    #   e3 "beta foods"               -> fuzz to leader 1 is 34.8 (<80) -> becomes leader 2
+    #   e4 "alpha traders beta foods" -> matches BOTH leader 1 and leader 2 at 100;
+    #                                    under the old representative single-linkage
+    #                                    pass this bridged the two groups into one.
+    #                                    Leader clustering must join it to the
+    #                                    FIRST matching leader (leader 1) only.
+    #   e5 "beta food"                -> fuzz to leader 1 is 27.3 (<80), to leader 2
+    #                                    is 94.7 (>=80) -> joins leader 2.
+    # Expected: two groups {e1, e2, e4} and {e3, e5}, not one merged group.
+    out = sibling_groups(_frame([
+        ("e1", "US", "S2", "alpha traders", "alphatraders", "1 main st sometown", "sometown"),
+        ("e2", "US", "S2", "alpha trader", "alphatrader", "1 main st sometown", "sometown"),
+        ("e3", "US", "S2", "beta foods", "betafoods", "1 main st sometown", "sometown"),
+        ("e4", "US", "S2", "alpha traders beta foods", "alphatradersbetafoods",
+         "1 main st sometown", "sometown"),
+        ("e5", "US", "S2", "beta food", "betafood", "1 main st sometown", "sometown"),
+    ]))
+    g = {eid: _group_of(out, eid) for eid in ("e1", "e2", "e3", "e4", "e5")}
+    assert g["e1"] == g["e2"] == g["e4"]
+    assert g["e3"] == g["e5"]
+    assert g["e1"] != g["e3"]
+    sizes = out.set_index("entity_id")["sib_group_size"]
+    assert sizes["e1"] == 3 and sizes["e3"] == 2
+
+
 def test_output_columns_and_determinism():
     frame = _frame([
         ("z2", "US", "S2", "porternall com", "porternall",

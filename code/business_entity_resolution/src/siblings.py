@@ -27,12 +27,17 @@ Scale guard: within a (country, source, addr_clean) group, records with an
 identical ``name_clean`` are linked directly (fully vectorized, no
 RapidFuzz call needed -- an exact match always satisfies the fuzzy
 threshold). When a group holds more than one distinct ``name_clean`` value,
-up to ``MAX_REPS`` representative names (the group's distinct names, sorted
-for determinism) are compared pairwise with RapidFuzz -- every distinct
-name against those representatives, not an all-pairs scan of the group's
-members. Groups of identical ``addr_clean`` larger than ``KEY_MAX`` skip the
-fuzzy link entirely and are reported via a log line; such a group's members
-can still link to each other through the name_key rules.
+its distinct names are clustered by deterministic leader clustering (R25,
+``_leader_cluster``): walked in entity_id order, each name joins the FIRST
+existing leader (of at most ``MAX_REPS``) whose RapidFuzz
+``token_set_ratio`` is >= ``FUZZ_THRESHOLD``, or becomes a new leader
+itself; edges only ever go from a name to its leader, so two leaders never
+merge with each other through this pass (unlike representative
+single-linkage, where a single record similar to two different leaders
+would chain them into one group). Groups of identical ``addr_clean`` larger
+than ``KEY_MAX`` skip the fuzzy link entirely and are reported via a log
+line; such a group's members can still link to each other through the
+name_key rules.
 
 Determinism: the input is sorted by ``entity_id`` before anything else, and
 ``sib_group_id`` is the dense rank (0-based) of a group's smallest
@@ -88,11 +93,45 @@ def _star_edges_from_code(code: np.ndarray):
     return _star_from_groups(order, start, count)
 
 
+def _leader_cluster(uniq: np.ndarray) -> np.ndarray:
+    """R25: deterministic leader clustering over a group's distinct names,
+    ``uniq`` given in entity_id order (smallest entity_id first). Each name
+    joins the FIRST existing leader (of at most ``MAX_REPS``) whose
+    ``fuzz.token_set_ratio`` is >= ``FUZZ_THRESHOLD``; otherwise it becomes
+    a new leader itself, or -- once ``MAX_REPS`` leaders exist and none
+    matches -- stays unlinked. Unlike representative single-linkage, edges
+    only ever go from a name to its leader, so two leaders never merge
+    with each other through this pass.
+
+    -> per distinct name, the index (into ``uniq``) of the leader it joins,
+    or its own index if it is a leader itself, or -1 if unlinked."""
+    n = len(uniq)
+    parent = np.full(n, -1, dtype=np.int64)
+    leaders: list[int] = []       # indices into uniq, insertion order
+    leader_names: list[str] = []  # uniq[leaders], kept in step for cdist
+    for i, name in enumerate(uniq.tolist()):
+        if leaders:
+            sim = process.cdist([name], leader_names, scorer=fuzz.token_set_ratio,
+                                 score_cutoff=FUZZ_THRESHOLD)[0]
+            hit = np.flatnonzero(sim > 0)
+            if len(hit):
+                parent[i] = leaders[hit[0]]
+                continue
+        if len(leaders) < MAX_REPS:
+            leaders.append(i)
+            leader_names.append(name)
+            parent[i] = i
+        # else: MAX_REPS leaders already exist and none matched -> unlinked
+    return parent
+
+
 def _addr_fuzzy_edges(effective_addr: np.ndarray, name_clean: np.ndarray, skipped_sizes: list[int]):
     """Bounded fuzzy-name edges within each valid ``effective_addr`` group
-    (see module docstring). Exact-name matches are handled elsewhere
-    (``_star_edges_from_code`` on the address+name key), so only distinct
-    name buckets are compared here."""
+    (see module docstring and ``_leader_cluster``). Exact-name matches are
+    handled elsewhere (``_star_edges_from_code`` on the address+name key),
+    so only distinct name buckets are compared here. Members are already in
+    entity_id order (the frame is sorted before this runs), so ``order``
+    within a group is entity_id order too."""
     valid = effective_addr >= 0
     if not valid.any():
         return _EMPTY, _EMPTY
@@ -105,19 +144,22 @@ def _addr_fuzzy_edges(effective_addr: np.ndarray, name_clean: np.ndarray, skippe
             skipped_sizes.append(int(len(members)))
             continue
         names = name_clean[members]
-        uniq, inv = np.unique(names, return_inverse=True)
+        # distinct names in order of first appearance (== entity_id order),
+        # and each one's first member position -- vectorized (no per-name
+        # np.flatnonzero scan): codes are assigned 0, 1, 2, ... in that same
+        # first-appearance order by pd.factorize(sort=False), so the first
+        # occurrence of code ``u`` is np.unique(codes, return_index=True)'s
+        # index for value ``u`` (unique code values are already 0..k-1).
+        codes, uniq = pd.factorize(names, sort=False)
+        _, first_idx = np.unique(codes, return_index=True)
+        bucket_first = members[first_idx]
         if len(uniq) == 1:
             continue  # identical names: already linked by the exact-key star edges
-        bucket_first = np.empty(len(uniq), dtype=np.int64)
-        for u in range(len(uniq)):
-            bucket_first[u] = members[np.flatnonzero(inv == u)[0]]
-        reps = uniq[:MAX_REPS]
-        sim = process.cdist(uniq.tolist(), reps.tolist(), scorer=fuzz.token_set_ratio,
-                             score_cutoff=FUZZ_THRESHOLD)
-        a_idx, b_idx = np.nonzero(sim)
-        keep = a_idx != b_idx
-        ii.extend(bucket_first[a_idx[keep]].tolist())
-        jj.extend(bucket_first[b_idx[keep]].tolist())
+        parent = _leader_cluster(uniq)
+        joined = np.flatnonzero((parent >= 0) & (parent != np.arange(len(uniq))))
+        if len(joined):
+            ii.extend(bucket_first[joined].tolist())
+            jj.extend(bucket_first[parent[joined]].tolist())
     if not ii:
         return _EMPTY, _EMPTY
     return np.array(ii, dtype=np.int64), np.array(jj, dtype=np.int64)

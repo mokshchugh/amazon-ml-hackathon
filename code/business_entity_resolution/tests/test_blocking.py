@@ -237,3 +237,50 @@ def test_proxy_query_restriction(toy):
     part = blocking._generate(s1, s23, s1_query=q, s23_query=set(s23["entity_id"]))
     full = cands[cands["s1_id"].isin(q)].reset_index(drop=True)
     pd.testing.assert_frame_equal(part.reset_index(drop=True), full)
+
+
+def _alias_of(names, frequent=frozenset()):
+    df = _frame([(f"S2-{k}", n, "", "US", "S2") for k, n in enumerate(names)])
+    return list(blocking._alias(df["name_clean"], df["alt_name"], set(frequent)))
+
+
+def test_alias_not_split_inside_initials():
+    # "a k a" / "t a" inside a run of single-letter initials is not an alias phrase
+    assert _alias_of(["M A K A Enterprises", "R T A Logistics Co"]) == ["", ""]
+
+
+def test_genuine_alias_kept():
+    assert _alias_of(["Apex Traders aka Blue Ocean Imports"]) == ["blue ocean imports"]
+
+
+def test_one_common_word_alias_rejected():
+    # a one-word alias made only of a frequent name word is not an alias ...
+    assert _alias_of(["Nike Aka Store"], frequent={"store"}) == [""]
+    # ... but a one-word alias with a rarer word is
+    assert _alias_of(["Nike Aka Synlyra"], frequent={"store"}) == ["synlyra"]
+
+
+def test_common_word_alias_gives_no_identity_bonus():
+    # "store" is the country's most frequent name word: S1 "Store" must not get
+    # an identical-name bonus with "Nike Aka Store"
+    s1 = _frame([("S1-1", "Store", "5 Oak Avenue, Dayton, OH", "US")], source="S1")
+    rows = [("S2-000", "Nike Aka Store", "9 Pine Street, Carmel, IN", "US", "S2")]
+    rows += [(f"S2-{k:03d}", f"Qx{k:02d} Store", f"{k + 10} Elm Street, Chicago, IL", "US", "S2")
+             for k in range(1, 8)]
+    cands = generate_candidates(s1, _frame(rows))
+    row = cands[cands["s23_id"] == "S2-000"]
+    assert len(row) == 0 or float(row["best_score"].iloc[0]) < 1.0
+
+
+def test_identity_bonus_independent_of_key_max(monkeypatch):
+    # identical names: the score must not depend on whether the (KEY_MAX-limited)
+    # identical-name key fired or only name search A found the pair
+    s1 = _frame([("S1-1", "Porter & Nall", "3220 Gale Street, Indianapolis, IN", "US")], source="S1")
+    s23 = _frame([("S2-1", "PORTER NALL", "", "US", "S2"),
+                  ("S2-2", "Porter & Nall LLC", "", "US", "S2")])
+    ref = generate_candidates(s1, s23).set_index("s23_id")["best_score"]
+    monkeypatch.setattr(blocking, "KEY_MAX", 1)
+    got = generate_candidates(s1, s23).set_index("s23_id")["best_score"]
+    assert set(got.index) == set(ref.index)
+    for k in ref.index:
+        assert got[k] == pytest.approx(ref[k])

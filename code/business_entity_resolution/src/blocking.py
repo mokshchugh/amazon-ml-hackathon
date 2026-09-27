@@ -20,11 +20,15 @@ For every country separately, several searches propose (Source 1, Source
 Key groups holding more than ``KEY_MAX`` records (S1 + S2 + S3) are
 skipped. Search D (embeddings) is off in v1 (``EMBED_ENABLED``).
 
-``best_score`` (the ranking score, range 0-2.6) is the name cosine -- 1.5
-when a name form is identical -- plus bonuses for an agreeing house number
-(any of the first three, 0.4), street (0.3), city (0.2) and postcode (0.2),
-computed for every pair whichever search found it, so address agreement
-decides between the hundreds of same-name records of a chain. At most
+``best_score`` is a ranking score, NOT a cosine: it ranges over 0 to about
+2.6. It is the name cosine -- replaced by 1.5 when the two records share an
+identical name form (``name_sorted``, ``name_key`` or alias, compared on the
+pair itself) -- plus bonuses for an agreeing house number (any of the first
+three, 0.4), street (0.3), city (0.2) and postcode (0.2). It is computed for
+every pair the same way whichever search found it, so address agreement
+decides between the hundreds of same-name records of a chain. An alias
+("x fka y" -> "y") is not taken from inside a run of single-letter initials,
+and a one-word alias must not be one of the country's top 1% name words. At most
 ``CAP_PER_SOURCE`` candidates per (Source 1 record, source) are kept,
 ranked by ``best_score`` (ties: smaller Source 2/3 id first).
 """
@@ -68,14 +72,17 @@ log = logging.getLogger(__name__)
 # 9 house number + city
 _KIND_BIT = np.array([SEARCH_B, SEARCH_B, SEARCH_C, SEARCH_A, SEARCH_C, SEARCH_C, SEARCH_C, SEARCH_B,
                       SEARCH_A, SEARCH_B], dtype=np.int8)
-_KIND_IDENT = (3, 8)
 
 # ranking score = name cosine + agreement bonuses (see ``_score``)
 _W_IDENT, _W_HOUSE, _W_STREET, _W_CITY, _W_POSTCODE = 0.5, 0.4, 0.3, 0.2, 0.2
 
-# alias phrases left inside name_clean by normalization ("X fka Y", ...)
-_ALIAS = (r"^(?:.+?)\s+(?:doing business as|d b a|dba|formerly known as|formerly|f k a|fka|"
-          r"a k a|aka|trading as|t a)\s+(.+)$")
+# alias phrases left inside name_clean by normalization ("X fka Y", ...),
+# longest first; "d/b/a" etc. reach name_clean as "d b a"
+_ALIAS_PHRASES = [("doing", "business", "as"), ("formerly", "known", "as"), ("d", "b", "a"),
+                  ("f", "k", "a"), ("a", "k", "a"), ("trading", "as"), ("t", "a"),
+                  ("dba",), ("fka",), ("aka",), ("formerly",)]
+_ALIAS_HINT = r"\s(?:d b a|dba|doing business as|formerly|f k a|fka|a k a|aka|trading as|t a)\s"
+_FREQUENT_SHARE = 0.01  # a one-word alias must not be one of the top 1% name words
 
 OUT_COLUMNS = ["s1_id", "s23_id", "source", "search_mask", "best_score"]
 _NEEDED = ["entity_id", "source", "country", "name_sorted", "name_clean", "name_key", "alt_name",
@@ -308,15 +315,16 @@ def _row_dot(x1, x2, i: np.ndarray, j: np.ndarray) -> np.ndarray:
 def _word_table(names: pd.Series):
     """Words of each record's name.
 
-    -> (rec, word): every distinct (record, word) pair, and ``rare``: per
+    -> (rec, word): every distinct (record, word) pair; ``rare``: per
     record, the code of its name word with the highest IDF (lowest
     record-level document frequency over all records given; ties ->
-    alphabetically first word), -1 when the name has no word."""
+    alphabetically first word), -1 when the name has no word; and the word
+    of each code."""
     names = _text(names)
     rec_u, uniq = pd.factorize(names)
     rare = np.full(len(names), -1, dtype=np.int64)
     if len(uniq) == 0:
-        return _EMPTY_I, _EMPTY_I, rare
+        return _EMPTY_I, _EMPTY_I, rare, []
     cnt = np.bincount(rec_u, minlength=len(uniq)).astype(np.float64)
     lists = pc.split_pattern(pa.array(np.asarray(uniq, dtype=object), type=pa.large_string()), " ")
     parent = pc.list_parent_indices(lists).to_numpy().astype(np.int64)
@@ -326,7 +334,7 @@ def _word_table(names: pd.Series):
     ok = wcode >= 0
     parent, wcode = parent[ok], wcode[ok]
     if len(wcode) == 0:
-        return _EMPTY_I, _EMPTY_I, rare
+        return _EMPTY_I, _EMPTY_I, rare, []
     n_w = len(wuniq)
     pair = np.unique(parent * n_w + wcode)
     parent, wcode = pair // n_w, pair % n_w
@@ -338,7 +346,7 @@ def _word_table(names: pd.Series):
     best = np.full(len(uniq), -1, dtype=np.int64)
     best[parent[o][first]] = wcode[o][first]
     rep, recs = _expand(parent, _groups(rec_u.astype(np.int64), len(uniq)))
-    return recs, wcode[rep], best[rec_u]
+    return recs, wcode[rep], best[rec_u], list(wuniq)
 
 
 def _rare_word_codes(names: pd.Series) -> np.ndarray:
@@ -375,17 +383,53 @@ def _first_k(rec: np.ndarray, code: np.ndarray, n: int, k: int = 3) -> np.ndarra
     return out
 
 
-def _alias(name_clean: pd.Series, alt_name: pd.Series) -> pd.Series:
+def _alias_ok(words: list[str], frequent: set[str]) -> bool:
+    """An alias needs 2+ words, or a word outside the frequent name words."""
+    return len(words) >= 2 or any(w not in frequent for w in words)
+
+
+def _alias_split(name: str, frequent: set[str]) -> str:
+    """The part after the first valid alias phrase of ``name`` ("x fka y" ->
+    "y"), "" if none. A phrase next to a single-letter token is part of a run
+    of initials ("m a k a enterprises"), not an alias phrase."""
+    toks = name.split()
+    for p in range(1, len(toks) - 1):
+        for ph in _ALIAS_PHRASES:
+            e = p + len(ph)
+            if e >= len(toks) or tuple(toks[p:e]) != ph:
+                continue
+            if len(toks[p - 1]) == 1 or len(toks[e]) == 1:
+                continue
+            if _alias_ok(toks[e:], frequent):
+                return " ".join(toks[e:])
+    return ""
+
+
+def _alias(name_clean: pd.Series, alt_name: pd.Series, frequent: set[str]) -> pd.Series:
     """The alternative name of each record: ``alt_name`` (dba), else the part
-    after an alias phrase left in ``name_clean`` ("x fka y" -> "y"); "" if none."""
+    after an alias phrase left in ``name_clean`` (``_alias_split``); "" if
+    none. A one-word alias made of a word in ``frequent`` is dropped."""
     nc = _text(name_clean)
-    alt = _text(alt_name)
-    has = nc.str.contains(r"\s(?:d b a|dba|doing business as|formerly|f k a|fka|a k a|aka|trading as|t a)\s",
-                          regex=True)
-    ext = pd.Series("", index=nc.index, dtype="string[pyarrow]")
-    if has.any():
-        ext[has] = nc[has].str.extract(_ALIAS, expand=False).fillna("")
-    return alt.mask(alt == "", ext)
+    alt = _text(alt_name).to_numpy(dtype=object)
+    out = np.full(len(nc), "", dtype=object)
+    for r in np.flatnonzero(alt != ""):
+        if _alias_ok(alt[r].split(), frequent):
+            out[r] = alt[r]
+    has = nc.str.contains(_ALIAS_HINT, regex=True).to_numpy(dtype=bool) & (out == "")
+    vals = nc.to_numpy(dtype=object)
+    for r in np.flatnonzero(has):
+        out[r] = _alias_split(vals[r], frequent)
+    return pd.Series(out, dtype="string[pyarrow]")
+
+
+def _frequent_words(w_code: np.ndarray, words: list[str]) -> set[str]:
+    """The top ``_FREQUENT_SHARE`` of distinct name words by record count
+    (at least one; ties -> smaller code)."""
+    if len(words) == 0:
+        return set()
+    df = np.bincount(w_code, minlength=len(words))
+    k = max(1, int(np.ceil(_FREQUENT_SHARE * len(words))))
+    return {words[c] for c in np.argsort(-df, kind="stable")[:k]}
 
 
 def _sorted_words(s: pd.Series) -> pd.Series:
@@ -394,11 +438,14 @@ def _sorted_words(s: pd.Series) -> pd.Series:
                      dtype="string[pyarrow]")
 
 
-def _name_forms(both: pd.DataFrame):
-    """Identity forms of each record's name -> (rec, form code): name_sorted,
-    name_key, and the sorted words / key of its alias (``_alias``)."""
+def _name_forms(both: pd.DataFrame, frequent: set[str]):
+    """Identity forms of each record's name: name_sorted, name_key, and the
+    sorted words / key of its alias (``_alias``).
+
+    -> (rec, form code) for every distinct pair, and the (n, 4) array of each
+    record's form codes (-1 = none) used for the identity test in ``_score``."""
     n = len(both)
-    alias = _alias(both["name_clean"], both["alt_name"])
+    alias = _alias(both["name_clean"], both["alt_name"], frequent)
     has = np.flatnonzero((alias != "").to_numpy())
     al = alias.iloc[has].reset_index(drop=True)
     al_sorted = _sorted_words(al)
@@ -410,11 +457,15 @@ def _name_forms(both: pd.DataFrame):
     forms = forms.mask(forms.isin(["s ", "k "]))
     rec = np.concatenate([np.arange(n), np.arange(n), has, has]).astype(np.int64)
     code = pd.factorize(forms)[0].astype(np.int64)
+    h = len(has)
+    forms4 = np.full((n, 4), -1, dtype=np.int64)
+    forms4[:, 0], forms4[:, 1] = code[:n], code[n:2 * n]
+    forms4[has, 2], forms4[has, 3] = code[2 * n:2 * n + h], code[2 * n + h:]
     ok = code >= 0
     rec, code = rec[ok], code[ok]
-    pair = np.unique(rec * (int(code.max()) + 1 if len(code) else 1) + code)
     m = int(code.max()) + 1 if len(code) else 1
-    return pair // m, pair % m
+    pair = np.unique(rec * m + code)
+    return pair // m, pair % m, forms4
 
 
 def _key_pairs(rec: np.ndarray, key: np.ndarray, n1: int, q1: np.ndarray):
@@ -457,10 +508,11 @@ def _search_keys(a: pd.DataFrame, b: pd.DataFrame, q1: np.ndarray):
     postcode, city, street = _codes(both["postcode"]), _codes(both["city"]), _codes(street_t)
     first_word = _codes(street_t.str.replace(r"\s.*$", "", regex=True))
     h_rec, h_code, house = _house_table(both["house_nums"])
-    w_rec, w_code, rare = _word_table(both["name_clean"])
-    f_rec, f_code = _name_forms(both)
+    w_rec, w_code, rare, words = _word_table(both["name_clean"])
+    f_rec, f_code, forms4 = _name_forms(both, _frequent_words(w_code, words))
     del both, street_t
-    feats = {"postcode": postcode, "city": city, "street": street, "house3": _first_k(h_rec, h_code, n)}
+    feats = {"postcode": postcode, "city": city, "street": street, "house3": _first_k(h_rec, h_code, n),
+             "forms": forms4}
     recs = np.arange(n, dtype=np.int64)
     keys = [
         lambda: (recs, _combine(postcode, house, first_word), 0),   # B exact: postcode + house + street word
@@ -485,24 +537,30 @@ def _search_keys(a: pd.DataFrame, b: pd.DataFrame, q1: np.ndarray):
     return np.concatenate(ii), np.concatenate(jj), np.concatenate(kk), feats
 
 
-def _score(i, j, cos, ident, n1, feats):
+def _any_equal(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """Row-wise: does any valid (>= 0) code of ``a`` equal any code of ``b``."""
+    hit = np.zeros(len(a), dtype=bool)
+    for x in range(a.shape[1]):
+        for y in range(b.shape[1]):
+            hit |= (a[:, x] == b[:, y]) & (a[:, x] >= 0)
+    return hit
+
+
+def _score(i, j, cos, n1, feats):
     """Ranking score: name cosine (1 + ``_W_IDENT`` when a name form is
     identical) + bonuses for agreeing house number (any of the first three),
     street, city, postcode."""
     jj = j.astype(np.int64) + n1
-    # an identical name form (e.g. the alias) counts as a full name match
-    sc = np.where(ident > 0, np.float32(1.0 + _W_IDENT), cos.astype(np.float32))
+    # an identical name form (e.g. the alias) counts as a full name match,
+    # tested on the pair itself whichever search found it
+    ident = _any_equal(feats["forms"][i], feats["forms"][jj])
+    sc = np.where(ident, np.float32(1.0 + _W_IDENT), cos.astype(np.float32))
     for name, w in (("street", _W_STREET), ("city", _W_CITY), ("postcode", _W_POSTCODE)):
         c = feats[name]
         ci, cj = c[i], c[jj]
         sc += w * ((ci == cj) & (ci >= 0))
     h = feats["house3"]
-    hi, hj = h[i], h[jj]
-    hit = np.zeros(len(i), dtype=bool)
-    for x in range(3):
-        for y in range(3):
-            hit |= (hi[:, x] == hj[:, y]) & (hi[:, x] >= 0)
-    sc += _W_HOUSE * hit
+    sc += _W_HOUSE * _any_equal(h[i], h[jj])
     return sc.astype(np.float32)
 
 
@@ -513,7 +571,7 @@ def _score(i, j, cos, ident, n1, feats):
 _SHARD = 250_000  # S1 records per merge shard (bounds merge memory)
 
 
-def _merge_shard(i, j, mask, acos, ident, n1, n2, tf, feats, src2):
+def _merge_shard(i, j, mask, acos, n1, n2, tf, feats, src2):
     """One row per (i, j): OR-ed search mask, name cosine, ranking score;
     then the top ``CAP_PER_SOURCE`` per (i, source)."""
     order = np.argsort(i.astype(np.int64) * n2 + j, kind="stable")
@@ -521,7 +579,6 @@ def _merge_shard(i, j, mask, acos, ident, n1, n2, tf, feats, src2):
     starts = np.flatnonzero(np.r_[True, (i[1:] != i[:-1]) | (j[1:] != j[:-1])])
     mask = np.bitwise_or.reduceat(mask[order], starts)
     cos = np.maximum.reduceat(acos[order], starts)
-    ident = np.maximum.reduceat(ident[order], starts)
     i, j = i[starts].astype(np.int64), j[starts].astype(np.int64)
     del order, starts
     need = cos < 0
@@ -529,8 +586,8 @@ def _merge_shard(i, j, mask, acos, ident, n1, n2, tf, feats, src2):
         cos[need] = _row_dot(tf[1], tf[1], tf[0][i[need]], tf[0][n1 + j[need]])
     else:
         cos[need] = 0.0
-    score = _score(i, j, cos, ident, n1, feats)
-    del cos, ident
+    score = _score(i, j, cos, n1, feats)
+    del cos
     # cap per (i, source): rank by score desc, then j (= s23 id order)
     s = src2[j]
     order = np.lexsort((j, -score, s, i))
@@ -572,15 +629,14 @@ def _country(a: pd.DataFrame, b: pd.DataFrame, q1: np.ndarray | None = None,
         return None
     mask = np.concatenate([np.full(len(ai), SEARCH_A, np.int8), _KIND_BIT[kind]])
     acos = np.concatenate([ascore, np.full(len(ki), -1.0, np.float32)])
-    ident = np.concatenate([np.zeros(len(ai), np.int8), np.isin(kind, _KIND_IDENT).astype(np.int8)])
     del ai, aj, ki, kj, kind, ascore
     out = []
     for lo in range(0, n1, _SHARD):
         sel = np.flatnonzero((i >= lo) & (i < lo + _SHARD))
         if len(sel):
-            out.append(_merge_shard(i[sel], j[sel], mask[sel], acos[sel], ident[sel],
+            out.append(_merge_shard(i[sel], j[sel], mask[sel], acos[sel],
                                     n1, n2, tf, feats, src2))
-    del i, j, mask, acos, ident, tf
+    del i, j, mask, acos, tf
     i, j, s, score, mask = (np.concatenate(p) for p in zip(*out))
     log.info("  merge+cap: %d pairs kept (%.0fs)", len(i), time.time() - t0)
 

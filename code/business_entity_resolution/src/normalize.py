@@ -19,12 +19,20 @@ from __future__ import annotations
 import json
 import re
 import unicodedata
+import warnings
 from collections import Counter
 from pathlib import Path
 from typing import Mapping
 
 import pandas as pd
-from indic_transliteration import sanscript
+
+# indic_transliteration loads its scheme files with codecs.open(), which
+# Python 3.14 deprecates (one DeprecationWarning per scheme file at import).
+# Silence exactly that warning, only around this import.
+with warnings.catch_warnings():
+    warnings.filterwarnings("ignore", message=r"codecs\.open\(\) is deprecated",
+                            category=DeprecationWarning)
+    from indic_transliteration import sanscript
 
 from lexicons import (
     ADDR_PREFIX_WORDS, AMBIGUOUS_ABBR, COUNTRY_ALIASES, DIRECTIONS,

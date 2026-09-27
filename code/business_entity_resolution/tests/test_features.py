@@ -169,10 +169,44 @@ def test_chunk_invariance(frames):
     pd.testing.assert_frame_equal(whole, parts)
 
 
-def test_compute_features_adds_context_when_missing(frames, feats):
+def test_compute_features_requires_context_columns(frames):
+    # context features need the whole per-country table; computing them from
+    # a chunk would silently change ranks/claimants with chunk boundaries
     cands, s1n, s23n, sib, idf = frames
-    out = compute_features(cands, s1n, s23n, sib, idf, n_jobs=1)
-    pd.testing.assert_frame_equal(out, feats)
+    with pytest.raises(ValueError, match="add_context_features"):
+        compute_features(cands, s1n, s23n, sib, idf, n_jobs=1)
+    ctx = add_context_features(cands, s1n, sib)
+    with pytest.raises(ValueError, match="c_rank_in_s1"):
+        compute_features(ctx.drop(columns=["c_rank_in_s1"]), s1n, s23n, sib, idf, n_jobs=1)
+
+
+def _ctx_frames(names):
+    s1n = pd.DataFrame({"entity_id": [f"S1-{k}" for k in range(len(names))], "country": "US",
+                        "name_sorted": names})
+    sib = pd.DataFrame({"entity_id": pd.Series([], dtype=object), "sib_group_size": np.array([], np.int32)})
+    return s1n, sib
+
+
+def test_n_claimants_counts_distinct_s1():
+    s1n, sib = _ctx_frames(["a", "b"])
+    cands = pd.DataFrame({
+        "s1_id": ["S1-0", "S1-0", "S1-1"],   # (S1-0, S2-9) appears twice
+        "s23_id": ["S2-9", "S2-9", "S2-9"],
+        "source": "S2", "search_mask": np.int8(1),
+        "best_score": np.array([2.0, 2.0, 1.0], dtype=np.float32),
+    })
+    out = add_context_features(cands, s1n, sib)
+    assert out["c_n_claimants"].tolist() == [2, 2, 2]
+
+
+def test_name_freq_nan_for_empty_name():
+    s1n, sib = _ctx_frames(["", "", "acme"])
+    cands = pd.DataFrame({"s1_id": ["S1-0", "S1-1", "S1-2"], "s23_id": ["S2-1", "S2-2", "S2-3"],
+                          "source": "S2", "search_mask": np.int8(1),
+                          "best_score": np.ones(3, dtype=np.float32)})
+    out = add_context_features(cands, s1n, sib)
+    assert np.isnan(out["c_name_freq"].iloc[0]) and np.isnan(out["c_name_freq"].iloc[1])
+    assert out["c_name_freq"].iloc[2] == 1
 
 
 def test_build_idf_rare_word_scores_higher():
@@ -183,7 +217,8 @@ def test_build_idf_rare_word_scores_higher():
 
 def test_empty_candidates(frames):
     cands, s1n, s23n, sib, idf = frames
-    out = compute_features(cands.iloc[:0], s1n, s23n, sib, idf, n_jobs=1)
+    ctx = add_context_features(cands.iloc[:0], s1n, sib)
+    out = compute_features(ctx, s1n, s23n, sib, idf, n_jobs=1)
     assert len(out) == 0
     assert list(out.columns) == ["s1_id", "s23_id"] + FEATURE_COLUMNS
 

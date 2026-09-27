@@ -312,8 +312,10 @@ def add_context_features(cands: pd.DataFrame, s1n: pd.DataFrame, sib: pd.DataFra
     out["c_rank_in_s1"] = _rank_within(c1, c23, score).astype(np.float32)
     out["c_gap_to_best"] = (best[c1] - score).astype(np.float32) if n else np.zeros(0, np.float32)
 
-    # claimants of each S2/S3 record (pairs are unique per blocking)
-    n_claim = np.bincount(c23, minlength=c23.max() + 1 if n else 0)
+    # claimants of each S2/S3 record: DISTINCT S1 records (duplicate pairs count once)
+    n23 = c23.max() + 1 if n else 0
+    pairs = _unique_sorted(c1.astype(np.int64) * max(n23, 1) + c23)
+    n_claim = np.bincount(pairs % max(n23, 1), minlength=n23)
     out["c_n_claimants"] = n_claim[c23].astype(np.float32)
     out["c_rank_among_claimants"] = _rank_within(c23, c1, score).astype(np.float32)
 
@@ -322,6 +324,7 @@ def add_context_features(cands: pd.DataFrame, s1n: pd.DataFrame, sib: pd.DataFra
     if "country" in s1n.columns:
         keys.insert(0, s1n["country"].astype("string").fillna(""))
     freq = s1n.groupby(keys, sort=False, dropna=False)["entity_id"].transform("size").to_numpy(dtype=np.float64)
+    freq[(keys[-1] == "").to_numpy(dtype=bool)] = np.nan  # empty name: no frequency
     pos = _find(s1n["entity_id"], np.asarray(u1, dtype=object))
     out["c_name_freq"] = np.where(pos >= 0, np.append(freq, np.nan)[pos], np.nan)[c1].astype(np.float32)
 
@@ -610,16 +613,19 @@ def compute_features(cands: pd.DataFrame, s1n: pd.DataFrame, s23n: pd.DataFrame,
                      addr_idf: Mapping[str, float] | None = None) -> pd.DataFrame:
     """Pair features for ``cands`` -> ``s1_id, s23_id`` + FEATURE_COLUMNS (float32).
 
-    ``cands`` should already carry the ``c_*`` columns from
-    ``add_context_features`` run on the whole per-country table; if they
-    are absent they are computed from ``cands`` itself. ``idf`` weights the
+    ``cands`` must already carry the ``c_*`` columns from
+    ``add_context_features`` run on the WHOLE per-country table (ValueError
+    otherwise); they are carried through unchanged. ``idf`` weights the
     name words (unseen words get the largest IDF). ``tfidf`` is the fitted
     char 3-gram model (``build_tfidf``) and ``addr_idf`` the address-token IDF
     (``build_idf`` on addresses); when omitted they are fitted on the names /
     addresses of the full ``s1n`` and ``s23n`` frames (deterministic, but slow
     on big frames -- pass them in production)."""
-    if not set(CONTEXT_FEATURES) <= set(cands.columns):
-        cands = add_context_features(cands, s1n, sib)
+    missing = [c for c in CONTEXT_FEATURES if c not in cands.columns]
+    if missing:
+        raise ValueError(
+            f"candidates lack context columns {missing}: call add_context_features on the WHOLE "
+            "per-country candidate table first (ranks and claimant counts are wrong on a chunk)")
     n = len(cands)
     if n == 0:
         out = pd.DataFrame({"s1_id": cands["s1_id"].to_numpy(), "s23_id": cands["s23_id"].to_numpy()})

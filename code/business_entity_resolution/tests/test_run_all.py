@@ -89,7 +89,9 @@ def test_tune_baseline_threshold_predicts_nothing_when_useless():
 def test_top1_per_s1_ties_to_smaller_id():
     c = pd.DataFrame({"s1_id": ["A", "A", "A", "B"], "s23_id": ["z", "b", "c", "k"],
                       "best_score": [0.5, 0.9, 0.9, 0.1]})
-    out = run_all.top1_per_s1(c)
+    c["source"] = "S2"
+    c["search_mask"] = 1
+    out = run_all.top1_per_s1(run_all.CandCodes.from_frame(c))
     assert dict(zip(out["s1_id"], out["s23_id"])) == {"A": "b", "B": "k"}
 
 
@@ -116,11 +118,12 @@ def _toy_cands(seed=0, n1=30, n23=20):
 
 def test_order_and_trim_groups_and_topk():
     df, _, _ = _toy_cands()
-    out = run_all.order_and_trim(df, None)
+    t = run_all.CandCodes.from_frame(df)
+    out = run_all.order_and_trim(t, None).frame()
     assert len(out) == len(df)
     codes = pd.factorize(out["s1_id"], sort=True)[0]
     assert np.all(np.diff(codes) >= 0)
-    top2 = run_all.order_and_trim(df, 2)
+    top2 = run_all.order_and_trim(t, 2).frame()
     assert top2.groupby(["s1_id", "source"]).size().max() <= 2
     for (s1, src), g in df.groupby(["s1_id", "source"]):
         want = g.sort_values(["best_score", "s23_id"], ascending=[False, True]).head(2)["s23_id"].tolist()
@@ -143,10 +146,10 @@ def test_s1_chunk_bounds_never_split_a_record():
 @pytest.mark.parametrize("seed", [0, 1, 2])
 def test_chunked_context_equals_whole_table(seed):
     df, s1, sib = _toy_cands(seed)
-    df = run_all.order_and_trim(df, None)
-    whole = features.add_context_features(df, s1, sib)
-    n_claim, rank_claim = run_all.claimant_features(df)
-    parts = [ctx for _, _, ctx in run_all.context_chunks(df, s1, sib, n_claim, rank_claim, max_rows=10)]
+    t = run_all.order_and_trim(run_all.CandCodes.from_frame(df), None)
+    whole = features.add_context_features(t.frame(), s1, sib)
+    n_claim, rank_claim = run_all.claimant_features(t)
+    parts = [ctx for _, _, ctx in run_all.context_chunks(t, s1, sib, n_claim, rank_claim, max_rows=10)]
     assert len(parts) > 3
     chunked = pd.concat(parts, ignore_index=True)
     for c in features.CONTEXT_FEATURES:
@@ -154,8 +157,7 @@ def test_chunked_context_equals_whole_table(seed):
 
 
 def test_grouped_lists_with_write_id_lists(tmp_path):
-    lists = run_all.GroupedLists(pd.Series(["A", "A", "B", "D", "D", "D"]),
-                                 pd.Series(["x", "y", "z", "u", "u", "v"]))
+    lists = run_all.GroupedLists.from_ids(["A", "A", "B", "D", "D", "D"], ["x", "y", "z", "u", "u", "v"])
     path = tmp_path / "c.tsv"
     io_utils.write_id_lists(path, "candidate_entity_ids", ["A", "B", "C", "D"], lists)
     assert path.read_text(encoding="utf-8").splitlines() == [
@@ -164,4 +166,33 @@ def test_grouped_lists_with_write_id_lists(tmp_path):
 
 def test_grouped_lists_rejects_non_contiguous():
     with pytest.raises(ValueError):
-        run_all.GroupedLists(pd.Series(["A", "B", "A"]), pd.Series(["x", "y", "z"]))
+        run_all.GroupedLists.from_ids(["A", "B", "A"], ["x", "y", "z"])
+
+
+def test_whole_table_context_matches_string_table():
+    """Code tables reproduce add_context_features on the original string frame
+    (tie order by id), for every row, in the grouped order."""
+    df, s1, sib = _toy_cands(5)
+    t = run_all.order_and_trim(run_all.CandCodes.from_frame(df), None)
+    ref = features.add_context_features(df, s1, sib)
+    got = features.add_context_features(t.frame(), s1, sib)
+    key = ["s1_id", "s23_id", "best_score"]
+    ref = ref.sort_values(key).reset_index(drop=True)
+    got = got.sort_values(key).reset_index(drop=True)
+    for c in features.CONTEXT_FEATURES:
+        np.testing.assert_array_equal(got[c].to_numpy(), ref[c].to_numpy(), err_msg=c)
+
+
+def test_load_cand_codes_roundtrip(tmp_path):
+    df, _, _ = _toy_cands(3)
+    df["search_mask"] = df["search_mask"].astype(np.int8)
+    df["best_score"] = df["best_score"].astype(np.float32)
+    path = tmp_path / "c.parquet"
+    df.to_parquet(path, index=False)
+    u1, u23 = run_all.sorted_ids(df["s1_id"]), run_all.sorted_ids(df["s23_id"])
+    t = run_all.load_cand_codes(path, u1, u23, batch_rows=7)
+    back = t.frame()
+    for c in run_all.CAND_COLS:
+        assert back[c].astype(str).tolist() == df[c].astype(str).tolist(), c
+    with pytest.raises(KeyError):
+        run_all.load_cand_codes(path, u1, run_all.sorted_ids(df["s23_id"].iloc[:3]))

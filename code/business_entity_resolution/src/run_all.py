@@ -160,10 +160,6 @@ def _truth_map(gt: pd.DataFrame, ids) -> dict[str, set[str]]:
     return out
 
 
-def _pair_keys(s1, s23) -> pa.Array:
-    return pc.binary_join_element_wise(_pa_str(s1), _pa_str(s23), "\x1f")
-
-
 def write_source_tsv(df: pd.DataFrame, path: Path) -> None:
     """Write raw source records as an organiser-style source TSV (for validate())."""
     with open(path, "w", encoding="utf-8", newline="\n") as f:
@@ -173,31 +169,6 @@ def write_source_tsv(df: pd.DataFrame, path: Path) -> None:
             f.write("\t".join(row) + "\n")
 
 
-class GroupedLists:
-    """Read-only ``.get`` mapping s1_id -> list of s23_ids over two parallel
-    arrow arrays whose s1_id runs are contiguous (memory-lean input for
-    ``io_utils.write_id_lists`` on 100M+ candidate pairs)."""
-
-    def __init__(self, s1_ids, s23_ids) -> None:
-        s1 = _pa_str(s1_ids)
-        self._s23 = _pa_str(s23_ids)
-        n = len(s1)
-        if n == 0:
-            self._idx: dict[str, tuple[int, int]] = {}
-            return
-        codes = np.asarray(pc.dictionary_encode(s1).indices, dtype=np.int64)
-        starts = np.flatnonzero(np.r_[True, codes[1:] != codes[:-1]])
-        ends = np.r_[starts[1:], n]
-        keys = s1.take(pa.array(starts)).to_pylist()
-        if len(set(keys)) != len(keys):
-            raise ValueError("s1_id runs are not contiguous")
-        self._idx = {k: (int(a), int(b)) for k, a, b in zip(keys, starts, ends)}
-
-    def get(self, key, default=None):
-        r = self._idx.get(key)
-        if r is None:
-            return default
-        return self._s23.slice(r[0], r[1] - r[0]).to_pylist()
 
 
 def _concat_id_list_parts(parts: Sequence[Path], out_path: Path, value_col: str) -> None:
@@ -246,19 +217,6 @@ def sample_slice(s1: pd.DataFrame, s23_index: pd.DataFrame, gt: pd.DataFrame | N
 # Candidates-only baseline (insurance submission)
 # ---------------------------------------------------------------------------
 
-def top1_per_s1(cands: pd.DataFrame) -> pd.DataFrame:
-    """Highest-best_score candidate per S1 record (ties -> smaller s23_id)."""
-    if len(cands) == 0:
-        return pd.DataFrame({"s1_id": [], "s23_id": [], "best_score": []})
-    c1, _ = pd.factorize(cands["s1_id"], sort=True)
-    c23, _ = pd.factorize(cands["s23_id"], sort=True)
-    score = cands["best_score"].to_numpy(dtype=np.float64)
-    order = np.lexsort((c23, -score, c1))
-    first = order[np.r_[True, c1[order][1:] != c1[order][:-1]]]
-    out = cands.iloc[first][["s1_id", "s23_id", "best_score"]].reset_index(drop=True)
-    return out
-
-
 def tune_baseline_threshold(top1: pd.DataFrame, truth: Mapping[str, set[str]],
                             s1_ids: Sequence[str]) -> tuple[float, float]:
     """Threshold t for "predict the top-1 candidate iff best_score >= t" that
@@ -293,71 +251,169 @@ def tune_baseline_threshold(top1: pd.DataFrame, truth: Mapping[str, set[str]],
     return best_t, best_total / n
 
 
+
+
 # ---------------------------------------------------------------------------
-# Per-country candidate tables and context features
+# Candidate tables as int codes
 # ---------------------------------------------------------------------------
 
-def read_country_cands(cands_path: Path, ids) -> pd.DataFrame:
-    """Candidate rows whose s1_id is in ``ids`` (lean columns, arrow strings)."""
-    if len(ids) == 0:
-        return pd.DataFrame({c: pd.Series([], dtype="string[pyarrow]") for c in ("s1_id", "s23_id", "source")}
-                            | {"search_mask": pd.Series([], dtype=np.int64),
-                               "best_score": pd.Series([], dtype=np.float32)})
-    dset = ds.dataset(str(cands_path), format="parquet")
-    tbl = dset.to_table(columns=CAND_COLS, filter=pc.field("s1_id").isin(_pa_str(list(ids))))
-    df = tbl.to_pandas()
-    del tbl
-    return _arrow_strings(df, ["s1_id", "s23_id", "source"])
+def sorted_ids(values) -> pa.Array:
+    """Unique ids, sorted (large_string)."""
+    arr = pc.unique(features._str_array(values))
+    return arr.take(pc.sort_indices(arr))
 
 
-def order_and_trim(df: pd.DataFrame, max_k: int | None) -> pd.DataFrame:
-    """Rows grouped by s1_id (sorted); with ``max_k`` keep the top-K rows per
-    (s1_id, source) by best_score (ties -> smaller s23_id)."""
-    if len(df) == 0:
-        return df.reset_index(drop=True)
-    c1, _ = pd.factorize(df["s1_id"], sort=True)
+def _codes_in(values, universe: pa.Array, missing_ok: bool = False) -> np.ndarray:
+    """Position of each value in ``universe`` (-1 if absent, KeyError unless ``missing_ok``)."""
+    idx = pc.index_in(features._str_array(values), value_set=universe)
+    if idx.null_count and not missing_ok:
+        raise KeyError(f"{idx.null_count} candidate ids not found in the record frames")
+    return np.asarray(idx.fill_null(-1), dtype=np.int32)
+
+
+class CandCodes:
+    """A candidate table held as int32 codes into SORTED id arrays ``u1``
+    (S1) and ``u23`` (S2/S3): code order == lexicographic id order, the tie
+    order ``add_context_features`` uses (factorize sort=True). About 14 bytes
+    per pair instead of ~45 for the string table."""
+
+    def __init__(self, u1: pa.Array, u23: pa.Array, s1c: np.ndarray, s23c: np.ndarray,
+                 is_s3: np.ndarray, mask: np.ndarray, score: np.ndarray) -> None:
+        self.u1, self.u23 = u1, u23
+        self.s1c, self.s23c, self.is_s3, self.mask, self.score = s1c, s23c, is_s3, mask, score
+
+    def __len__(self) -> int:
+        return len(self.s1c)
+
+    def subset(self, rows) -> "CandCodes":
+        return CandCodes(self.u1, self.u23, self.s1c[rows], self.s23c[rows], self.is_s3[rows],
+                         self.mask[rows], self.score[rows])
+
+    def s1_ids(self, a: int = 0, b: int | None = None) -> pa.Array:
+        return self.u1.take(pa.array(self.s1c[a:b]))
+
+    def s23_ids(self, a: int = 0, b: int | None = None) -> pa.Array:
+        return self.u23.take(pa.array(self.s23c[a:b]))
+
+    def frame(self, a: int = 0, b: int | None = None) -> pd.DataFrame:
+        """Rows a:b as the string candidate frame (CAND_COLS)."""
+        return pd.DataFrame({
+            "s1_id": pd.Series(pd.arrays.ArrowStringArray(self.s1_ids(a, b).cast(pa.string()))),
+            "s23_id": pd.Series(pd.arrays.ArrowStringArray(self.s23_ids(a, b).cast(pa.string()))),
+            "source": pd.Series(np.where(self.is_s3[a:b], "S3", "S2"), dtype="string[pyarrow]"),
+            "search_mask": self.mask[a:b],
+            "best_score": self.score[a:b],
+        })
+
+    @classmethod
+    def from_frame(cls, df: pd.DataFrame, u1: pa.Array | None = None, u23: pa.Array | None = None) -> "CandCodes":
+        u1 = sorted_ids(df["s1_id"]) if u1 is None else u1
+        u23 = sorted_ids(df["s23_id"]) if u23 is None else u23
+        return cls(u1, u23, _codes_in(df["s1_id"], u1), _codes_in(df["s23_id"], u23),
+                   np.asarray(pc.equal(features._str_array(df["source"]), "S3")),
+                   df["search_mask"].to_numpy(), df["best_score"].to_numpy())
+
+
+def load_cand_codes(path: Path, u1: pa.Array, u23: pa.Array, batch_rows: int = 8_000_000) -> CandCodes:
+    """Stream the candidate parquet into codes (one pass, bounded memory)."""
+    parts = []
+    for batch in pq.ParquetFile(path).iter_batches(batch_size=batch_rows, columns=CAND_COLS):
+        parts.append((_codes_in(batch.column("s1_id"), u1), _codes_in(batch.column("s23_id"), u23),
+                      np.asarray(pc.equal(features._str_array(batch.column("source")), "S3")),
+                      batch.column("search_mask").to_numpy(), batch.column("best_score").to_numpy()))
+    if not parts:
+        return CandCodes(u1, u23, np.zeros(0, np.int32), np.zeros(0, np.int32), np.zeros(0, bool),
+                         np.zeros(0, np.int8), np.zeros(0, np.float32))
+    return CandCodes(u1, u23, *[np.concatenate([p[i] for p in parts]) for i in range(5)])
+
+
+class GroupedLists:
+    """Read-only ``.get`` mapping s1_id -> list of s23_ids over a CandCodes
+    table whose S1 codes form contiguous runs (memory-lean input for
+    ``io_utils.write_id_lists`` on 100M+ candidate pairs)."""
+
+    def __init__(self, t: CandCodes) -> None:
+        self._t = t
+        n = len(t)
+        self._idx: dict[str, tuple[int, int]] = {}
+        if n == 0:
+            return
+        starts = np.flatnonzero(np.r_[True, t.s1c[1:] != t.s1c[:-1]])
+        ends = np.r_[starts[1:], n]
+        keys = t.u1.take(pa.array(t.s1c[starts])).to_pylist()
+        if len(set(keys)) != len(keys):
+            raise ValueError("s1_id runs are not contiguous")
+        self._idx = {k: (int(a), int(b)) for k, a, b in zip(keys, starts, ends)}
+
+    @classmethod
+    def from_ids(cls, s1_ids, s23_ids) -> "GroupedLists":
+        df = pd.DataFrame({"s1_id": list(s1_ids), "s23_id": list(s23_ids), "source": "S2",
+                           "search_mask": 0, "best_score": 0.0})
+        return cls(CandCodes.from_frame(df))
+
+    def get(self, key, default=None):
+        r = self._idx.get(key)
+        if r is None:
+            return default
+        return self._t.s23_ids(r[0], r[1]).to_pylist()
+
+
+def top1_per_s1(t: CandCodes) -> pd.DataFrame:
+    """Highest-best_score candidate per S1 record (ties -> smaller s23_id)."""
+    if len(t) == 0:
+        return pd.DataFrame({"s1_id": pd.Series([], dtype=object), "s23_id": pd.Series([], dtype=object),
+                             "best_score": np.zeros(0)})
+    order = np.lexsort((t.s23c, -t.score.astype(np.float64), t.s1c))
+    s1o = t.s1c[order]
+    sub = t.subset(order[np.r_[True, s1o[1:] != s1o[:-1]]])
+    return pd.DataFrame({"s1_id": sub.s1_ids().to_pylist(), "s23_id": sub.s23_ids().to_pylist(),
+                         "best_score": sub.score.astype(np.float64)})
+
+
+def order_and_trim(t: CandCodes, max_k: int | None) -> CandCodes:
+    """Rows grouped by S1 (ascending id); with ``max_k`` keep the top-K rows
+    per (S1, source) by best_score (ties -> smaller s23_id)."""
+    if len(t) == 0:
+        return t
     if max_k is not None:
-        c23, _ = pd.factorize(df["s23_id"], sort=True)
-        cs, _ = pd.factorize(df["source"], sort=True)
-        score = df["best_score"].to_numpy(dtype=np.float64)
-        order = np.lexsort((c23, -score, cs, c1))
-        g = c1[order].astype(np.int64) * (cs.max() + 1) + cs[order]
+        order = np.lexsort((t.s23c, -t.score.astype(np.float64), t.is_s3, t.s1c))
+        g = t.s1c[order].astype(np.int64) * 2 + t.is_s3[order]
         start = np.flatnonzero(np.r_[True, g[1:] != g[:-1]])
         rank = np.arange(len(g)) - np.repeat(start, np.diff(np.r_[start, len(g)]))
         order = order[rank < max_k]
-        del c23, cs, score, g, rank
-    elif np.all(c1[1:] >= c1[:-1]):
-        return df.reset_index(drop=True)
+        del g, rank
+    elif np.all(t.s1c[1:] >= t.s1c[:-1]):
+        return t
     else:
-        order = np.argsort(c1, kind="stable")
-    return df.iloc[order].reset_index(drop=True)
+        order = np.argsort(t.s1c, kind="stable")
+    return t.subset(order)
 
 
-def claimant_features(df: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
-    """c_n_claimants / c_rank_among_claimants over the WHOLE table ``df``,
+def claimant_features(t: CandCodes) -> tuple[np.ndarray, np.ndarray]:
+    """c_n_claimants / c_rank_among_claimants over the WHOLE table ``t``,
     exactly as ``features.add_context_features`` defines them."""
-    n = len(df)
-    if n == 0:
+    if len(t) == 0:
         return np.zeros(0, np.float32), np.zeros(0, np.float32)
-    c1, _ = pd.factorize(df["s1_id"], sort=True)
-    c23, u23 = pd.factorize(df["s23_id"], sort=True)
-    c1 = c1.astype(np.int64)
-    c23 = c23.astype(np.int64)
-    n23 = max(len(u23), 1)
+    c1 = t.s1c.astype(np.int64)
+    c23 = t.s23c.astype(np.int64)
+    n23 = max(len(t.u23), 1)
     pairs = features._unique_sorted(c1 * n23 + c23)
     n_claim = np.bincount(pairs % n23, minlength=n23)[c23].astype(np.float32)
     del pairs
-    rank = features._rank_within(c23, c1, df["best_score"].to_numpy(dtype=np.float64)).astype(np.float32)
+    rank = features._rank_within(c23, c1, t.score.astype(np.float64)).astype(np.float32)
     return n_claim, rank
 
 
-def s1_chunk_bounds(s1_ids, max_rows: int = CHUNK_ROWS) -> list[tuple[int, int]]:
+def s1_chunk_bounds(s1, max_rows: int = CHUNK_ROWS) -> list[tuple[int, int]]:
     """[start, end) row ranges of <= ``max_rows`` rows that never split a run
-    of equal (contiguous) s1_ids."""
-    n = len(s1_ids)
+    of equal (contiguous) S1 codes / ids."""
+    n = len(s1)
     if n == 0:
         return []
-    codes = np.asarray(pc.dictionary_encode(_pa_str(s1_ids)).indices, dtype=np.int64)
+    if isinstance(s1, np.ndarray) and s1.dtype.kind in "iu":
+        codes = s1
+    else:
+        codes = np.asarray(pc.dictionary_encode(features._str_array(s1)).indices, dtype=np.int64)
     starts = np.flatnonzero(np.r_[True, codes[1:] != codes[:-1]])
     # greedy: close the chunk before the S1 group that would overflow it
     bounds, a, prev = [], 0, 0
@@ -370,17 +426,15 @@ def s1_chunk_bounds(s1_ids, max_rows: int = CHUNK_ROWS) -> list[tuple[int, int]]
     return bounds
 
 
-def context_chunks(df: pd.DataFrame, s1_ctx: pd.DataFrame, sib: pd.DataFrame,
+def context_chunks(t: CandCodes, s1_ctx: pd.DataFrame, sib: pd.DataFrame,
                    n_claim: np.ndarray, rank_claim: np.ndarray, max_rows: int = CHUNK_ROWS):
-    """Yield (start, end, ctx) over S1-aligned chunks of ``df`` (grouped by
-    s1_id) with the context columns of the whole table (see module doc)."""
-    for a, b in s1_chunk_bounds(df["s1_id"], max_rows):
-        sub = df.iloc[a:b].reset_index(drop=True)
-        ctx = features.add_context_features(sub, s1_ctx, sib)
+    """Yield (start, end, ctx) over S1-aligned chunks of ``t`` (grouped by S1)
+    with the context columns of the whole table (see module doc)."""
+    for a, b in s1_chunk_bounds(t.s1c, max_rows):
+        ctx = features.add_context_features(t.frame(a, b), s1_ctx, sib)
         ctx["c_n_claimants"] = n_claim[a:b]
         ctx["c_rank_among_claimants"] = rank_claim[a:b]
         yield a, b, ctx
-
 
 # ---------------------------------------------------------------------------
 # Split preparation (prod caches or limit-mode slice)
@@ -548,12 +602,41 @@ def build_text_models(data: SplitData, log: RunLog) -> TextModels:
     return TextModels(idf, tfidf, addr_idf)
 
 
-def _countries(s1n: pd.DataFrame) -> list[tuple[str, list[str]]]:
-    c = s1n["country"].astype("string").fillna("")
-    out = []
-    for country in sorted(c.unique().tolist()):
-        out.append((country, s1n.loc[(c == country).to_numpy(), "entity_id"].astype(str).tolist()))
-    return out
+
+@dataclasses.dataclass
+class Universe:
+    """Sorted S1 / S2-S3 id arrays of a split, the country of each S1 code,
+    and the candidate table as codes."""
+    u1: pa.Array
+    u23: pa.Array
+    countries: list[str]
+    s1_cc: np.ndarray        # country index per S1 code
+    cands: CandCodes
+
+    def country_rows(self, k: int) -> np.ndarray:
+        return np.flatnonzero(self.s1_cc[self.cands.s1c] == k)
+
+    def ids_where(self, keep: np.ndarray) -> list[str]:
+        return self.u1.filter(pa.array(keep)).to_pylist()
+
+
+def build_universe(data: SplitData, log: RunLog) -> Universe:
+    with log.stage("load candidates"):
+        u1 = sorted_ids(data.s1n["entity_id"])
+        u23 = sorted_ids(data.s23n["entity_id"])
+        pos = _codes_in(data.s1n["entity_id"], u1)
+        cc, countries = pd.factorize(data.s1n["country"].astype("string").fillna("").to_numpy(dtype=object),
+                                     sort=True)
+        s1_cc = np.empty(len(u1), dtype=np.int32)
+        s1_cc[pos] = cc
+        cands = load_cand_codes(data.cands_path, u1, u23)
+        log.msg(f"{len(u1)} S1, {len(u23)} S2/S3, {len(cands)} candidate pairs")
+    return Universe(u1, u23, [str(c) for c in countries], s1_cc, cands)
+
+
+def _s1_ctx(data: SplitData, country: str) -> pd.DataFrame:
+    c = data.s1n["country"].astype("string").fillna("")
+    return data.s1n.loc[(c == country).to_numpy(), S1_CTX_COLS]
 
 
 def _features(ctx: pd.DataFrame, data: SplitData, tm: TextModels) -> pd.DataFrame:
@@ -561,24 +644,45 @@ def _features(ctx: pd.DataFrame, data: SplitData, tm: TextModels) -> pd.DataFram
                                      tfidf=tm.tfidf, addr_idf=tm.addr_idf)
 
 
-def _score_rows(df, n_claim, rank_claim, s1_ctx, data, tm, booster, cal) -> pd.DataFrame:
-    """Features + calibrated p for every row of ``df``; keeps p >= P_FLOOR."""
-    parts = []
-    for a, b, ctx in context_chunks(df, s1_ctx, data.sib, n_claim, rank_claim):
+def _score_rows(t: CandCodes, n_claim, rank_claim, s1_ctx, data, tm, booster, cal) -> pd.DataFrame:
+    """Features + calibrated p for every row of ``t``; keeps p >= P_FLOOR.
+    Returns (s1_id, s23_id, p)."""
+    keep_rows, keep_p = [], []
+    for a, b, ctx in context_chunks(t, s1_ctx, data.sib, n_claim, rank_claim):
         X = _features(ctx, data, tm)
         p = train.predict_proba(booster, cal, X[features.FEATURE_COLUMNS])
-        keep = p >= P_FLOOR
-        parts.append(pd.DataFrame({"s1_id": X["s1_id"].to_numpy()[keep], "s23_id": X["s23_id"].to_numpy()[keep],
-                                   "p": p[keep]}))
+        keep = np.flatnonzero(p >= P_FLOOR)
+        keep_rows.append(a + keep)
+        keep_p.append(p[keep])
         del X, ctx
-    if not parts:
-        return pd.DataFrame({"s1_id": pd.Series([], dtype="string[pyarrow]"),
-                             "s23_id": pd.Series([], dtype="string[pyarrow]"), "p": np.zeros(0, np.float32)})
-    return _arrow_strings(pd.concat(parts, ignore_index=True), ["s1_id", "s23_id"])
+    rows = np.concatenate(keep_rows) if keep_rows else np.zeros(0, np.int64)
+    sub = t.subset(rows)
+    out = sub.frame()[["s1_id", "s23_id"]]
+    out["p"] = np.concatenate(keep_p) if keep_p else np.zeros(0, np.float32)
+    return out
 
 
 def _decision_params_path(tag: str) -> Path:
     return Path(config.MODELS_DIR) / tag / "decision_params.json"
+
+
+def _in_sorted(keys: np.ndarray, sorted_keys: np.ndarray) -> np.ndarray:
+    if len(sorted_keys) == 0:
+        return np.zeros(len(keys), dtype=bool)
+    pos = np.minimum(np.searchsorted(sorted_keys, keys), len(sorted_keys) - 1)
+    return sorted_keys[pos] == keys
+
+
+def _write_candidate_file(out_dir: Path, pieces: Sequence[tuple[list[str], CandCodes | None]]) -> None:
+    """candidate_pairs.tsv from per-country (S1 ids, grouped table) pieces."""
+    parts = []
+    for i, (ids, t) in enumerate(pieces):
+        part = out_dir / f"_cands_part{i}.tsv"
+        io_utils.write_id_lists(part, "candidate_entity_ids", ids, GroupedLists(t) if t is not None else {})
+        parts.append(part)
+    _concat_id_list_parts(parts, out_dir / "candidate_pairs.tsv", "candidate_entity_ids")
+    for part in parts:
+        part.unlink()
 
 
 # ---------------------------------------------------------------------------
@@ -595,75 +699,75 @@ def run_train(args, log: RunLog, slice_hook=None) -> dict:
         _ensure_raw_cache("train")
         splits.ensure_splits()
         holdout = splits.load_split("holdout")
-        gt = pd.read_parquet(config.CACHE_DIR / "gt_pairs.parquet")
-        gt = _arrow_strings(gt, ["s1_id", "s23_id"])
+        gt = _arrow_strings(pd.read_parquet(config.CACHE_DIR / "gt_pairs.parquet"), ["s1_id", "s23_id"])
     data = prepare_limit("train", limit, work, log, slice_hook) if limit else prepare_prod("train", log)
     tm = build_text_models(data, log)
+    uni = build_universe(data, log)
+    u1, n23 = uni.u1, max(len(uni.u23), 1)
 
-    all_s1 = data.s1n["entity_id"].astype(str).tolist()
-    report_ids = sorted(set(all_s1) & holdout)
-    eval_ids = sorted(all_s1) if limit else report_ids
-    nonhold = sorted(set(all_s1) - holdout)
+    is_hold = np.asarray(pc.is_in(u1, value_set=features._str_array(sorted(holdout))))
+    nonhold = np.flatnonzero(~is_hold)
     rng = np.random.default_rng(config.SEED)
-    sample_ids = set(np.asarray(nonhold, dtype=object)[
-        np.sort(rng.choice(len(nonhold), size=min(args.train_sample, len(nonhold)), replace=False))].tolist())
-    eval_set = set(eval_ids)
+    is_train = np.zeros(len(u1), dtype=bool)
+    is_train[nonhold[rng.choice(len(nonhold), size=min(args.train_sample, len(nonhold)), replace=False)]] = True
+    is_eval = np.ones(len(u1), dtype=bool) if limit else is_hold
+    report_ids = uni.ids_where(is_hold)
     report_set = set(report_ids)
-    log.msg(f"S1: {len(all_s1)}; train sample {len(sample_ids)}; eval {len(eval_ids)}; holdout {len(report_ids)}")
-    gt_keys = _pair_keys(gt["s1_id"], gt["s23_id"])
+    log.msg(f"S1: {len(u1)}; train sample {int(is_train.sum())}; eval {int(is_eval.sum())}; "
+            f"holdout {len(report_ids)}")
+
+    g1 = _codes_in(gt["s1_id"], u1, missing_ok=True).astype(np.int64)
+    g23 = _codes_in(gt["s23_id"], uni.u23, missing_ok=True).astype(np.int64)
+    ok = (g1 >= 0) & (g23 >= 0)
+    gt_keys = np.unique(g1[ok] * n23 + g23[ok])
+    gt_hold_keys = np.unique(g1[ok & is_hold[np.maximum(g1, 0)]] * n23 + g23[ok & is_hold[np.maximum(g1, 0)]])
+    truth = _truth_map(gt, report_set)
+    n_true = sum(len(v) for v in truth.values())
+    del g1, g23, ok
 
     # ---- pass 1: training features; keep eval rows for pass 2 --------------
-    X_parts, y_parts, g_parts = [], [], []
-    eval_tables = []
-    top1_parts = []
-    blk_hit = 0
-    n_cand_rows = 0
-    s1n_ctx_all = data.s1n[S1_CTX_COLS]
+    X_parts, y_parts, g_parts, eval_tables, top1_parts = [], [], [], [], []
+    blk_hit, n_cand_rows = 0, 0
     with log.stage("features (train sample)"):
-        for country, ids in _countries(data.s1n):
-            df = order_and_trim(read_country_cands(data.cands_path, ids), args.max_cands_per_source)
-            n_cand_rows += len(df)
-            n_claim, rank_claim = claimant_features(df)
-            s1_ctx = s1n_ctx_all[s1n_ctx_all["country"].astype("string").fillna("") == country]
-            s1arr = _pa_str(df["s1_id"])
-            m_train = np.asarray(pc.is_in(s1arr, value_set=_pa_str(sorted(sample_ids & set(ids)))))
-            m_eval = np.asarray(pc.is_in(s1arr, value_set=_pa_str(sorted(eval_set & set(ids)))))
-            m_rep = np.asarray(pc.is_in(s1arr, value_set=_pa_str(sorted(report_set & set(ids)))))
+        for k, country in enumerate(uni.countries):
+            t = order_and_trim(uni.cands.subset(uni.country_rows(k)), args.max_cands_per_source)
+            n_cand_rows += len(t)
+            n_claim, rank_claim = claimant_features(t)
+            m_train, m_eval, m_rep = is_train[t.s1c], is_eval[t.s1c], is_hold[t.s1c]
             if m_rep.any():
-                rep = df[m_rep]
+                rep = t.subset(m_rep)
                 top1_parts.append(top1_per_s1(rep))
-                blk_hit += int(np.asarray(pc.is_in(gt_keys, value_set=_pair_keys(rep["s1_id"], rep["s23_id"])))
-                               .sum()) if len(rep) else 0
-            if m_eval.any():
-                eval_tables.append((country, df[m_eval].reset_index(drop=True), n_claim[m_eval], rank_claim[m_eval]))
-            tr = df[m_train].reset_index(drop=True)
-            nc_t, rc_t = n_claim[m_train], rank_claim[m_train]
-            del df, n_claim, rank_claim, s1arr
+                blk_hit += int(np.isin(gt_hold_keys, rep.s1c.astype(np.int64) * n23 + rep.s23c).sum())
+                del rep
+            eval_tables.append((k, t.subset(m_eval), n_claim[m_eval], rank_claim[m_eval]))
+            tr, nc_t, rc_t = t.subset(m_train), n_claim[m_train], rank_claim[m_train]
+            del t, n_claim, rank_claim
             gc.collect()
+            s1_ctx = _s1_ctx(data, country)
             for a, b, ctx in context_chunks(tr, s1_ctx, data.sib, nc_t, rc_t):
                 X = _features(ctx, data, tm)
-                keys = _pair_keys(X["s1_id"], X["s23_id"])
-                y_parts.append(np.asarray(pc.is_in(keys, value_set=gt_keys)).astype(np.int8))
+                y_parts.append(_in_sorted(tr.s1c[a:b].astype(np.int64) * n23 + tr.s23c[a:b], gt_keys))
                 X_parts.append(X[features.FEATURE_COLUMNS].to_numpy(dtype=np.float32))
-                g_parts.append(_pa_str(X["s1_id"]))
-                del X, ctx, keys
-            log.msg(f"country {country}: train rows so far {sum(len(y) for y in y_parts)}")
-            del tr
+                g_parts.append(tr.s1c[a:b])
+                del X, ctx
+            log.msg(f"country {country!r}: train rows so far {sum(len(y) for y in y_parts)}")
+            del tr, nc_t, rc_t
             gc.collect()
+    uni.cands = None
+    gc.collect()
 
     # ---- baseline threshold (holdout candidates) ---------------------------
-    truth = _truth_map(gt, report_set)
-    top1 = pd.concat(top1_parts, ignore_index=True) if top1_parts else top1_per_s1(pd.DataFrame(columns=CAND_COLS))
+    top1 = pd.concat(top1_parts, ignore_index=True) if top1_parts else top1_per_s1(
+        CandCodes(u1, uni.u23, *[np.zeros(0, d) for d in (np.int32, np.int32, bool, np.int8, np.float32)]))
     t_base, f_base = tune_baseline_threshold(top1, truth, report_ids)
-    n_true = sum(len(v) for v in truth.values())
     blocking_recall = blk_hit / n_true if n_true else 1.0
     tag_dir = Path(config.MODELS_DIR) / tag
     tag_dir.mkdir(parents=True, exist_ok=True)
-    base_json = {"threshold": t_base, "holdout_macro_f05": f_base, "tag": tag,
-                 "max_cands_per_source": args.max_cands_per_source}
-    (tag_dir / "baseline.json").write_text(json.dumps(base_json, indent=2), encoding="utf-8")
+    base_json = json.dumps({"threshold": t_base, "holdout_macro_f05": f_base, "tag": tag,
+                            "max_cands_per_source": args.max_cands_per_source}, indent=2)
+    (tag_dir / "baseline.json").write_text(base_json, encoding="utf-8")
     if not limit:
-        (Path(config.MODELS_DIR) / "baseline.json").write_text(json.dumps(base_json, indent=2), encoding="utf-8")
+        (Path(config.MODELS_DIR) / "baseline.json").write_text(base_json, encoding="utf-8")
     log.msg(f"baseline: threshold={t_base:.4f} holdout macro F0.5={f_base:.4f}; blocking recall={blocking_recall:.4f}")
 
     # ---- train ---------------------------------------------------------------
@@ -671,43 +775,41 @@ def run_train(args, log: RunLog, slice_hook=None) -> dict:
         X = pd.DataFrame(np.concatenate(X_parts), columns=features.FEATURE_COLUMNS)
         del X_parts
         y = np.concatenate(y_parts).astype(np.float64)
-        groups, _ = pd.factorize(pa.chunked_array(g_parts).to_pandas())
-        del g_parts
+        groups = np.concatenate(g_parts)
+        del y_parts, g_parts
         gc.collect()
-        log.msg(f"training rows {len(X)}, positives {int(y.sum())}")
+        n_train_rows, n_pos = len(X), int(y.sum())
+        log.msg(f"training rows {n_train_rows}, positives {n_pos}")
         params = dict(train.LGB_PARAMS, learning_rate=LEARNING_RATE)
         t_train = time.time()
         booster, oof = train.train_model(X, y, groups, max_rounds=MAX_ROUNDS, params=params)
         cal = train.fit_calibrator(oof, y)
         train_seconds = time.time() - t_train
-        n_train_rows, n_pos = len(X), int(y.sum())
         del X, y, groups, oof
         gc.collect()
         train.save(booster, cal, tag)
         log.msg(f"trained in {train_seconds:.0f}s, {booster.current_iteration()} rounds")
 
     # ---- pass 2: score eval rows ----------------------------------------------
-    scored_parts = []
     with log.stage("score eval"):
-        for country, df, n_claim, rank_claim in eval_tables:
-            s1_ctx = s1n_ctx_all[s1n_ctx_all["country"].astype("string").fillna("") == country]
-            scored_parts.append(_score_rows(df, n_claim, rank_claim, s1_ctx, data, tm, booster, cal))
-        eval_cands = [(c, df[["s1_id", "s23_id"]]) for c, df, _, _ in eval_tables]
-        del eval_tables
-        gc.collect()
-        scored = pd.concat(scored_parts, ignore_index=True) if scored_parts else _score_rows(
-            pd.DataFrame(columns=CAND_COLS), np.zeros(0), np.zeros(0), None, data, tm, booster, cal)
+        scored_parts = []
+        for k, t, n_claim, rank_claim in eval_tables:
+            scored_parts.append(_score_rows(t, n_claim, rank_claim, _s1_ctx(data, uni.countries[k]),
+                                            data, tm, booster, cal))
+        scored = pd.concat(scored_parts, ignore_index=True)
+        del scored_parts
         log.msg(f"scored rows kept (p >= {P_FLOOR}): {len(scored)}")
 
     with log.stage("tune decision"):
-        rep_scored = scored[scored["s1_id"].isin(report_set)].reset_index(drop=True)
+        rep_scored = scored[scored["s1_id"].isin(report_set).to_numpy()].reset_index(drop=True)
         params_d = decide.tune(rep_scored, data.sib, truth, report_ids)
+        del rep_scored
         _decision_params_path(tag).write_text(json.dumps(dataclasses.asdict(params_d), indent=2), encoding="utf-8")
         log.msg(f"decision params: {params_d}")
     with log.stage("decide + report"):
         matches = decide.decide(scored, data.sib, params_d)
-        s1_country = dict(zip(data.s1n["entity_id"].astype(str), data.s1n["country"].astype(str)))
-        rep = evaluate.report({k: set(v) for k, v in matches.items() if k in report_set}, truth,
+        s1_country = dict(zip(u1.to_pylist(), [uni.countries[c] for c in uni.s1_cc]))
+        rep = evaluate.report({s: set(matches.get(s, ())) for s in report_ids}, truth,
                               {s: s1_country[s] for s in report_ids})
         rep["blocking_recall"] = blocking_recall
         rep["baseline_threshold"] = t_base
@@ -717,33 +819,21 @@ def run_train(args, log: RunLog, slice_hook=None) -> dict:
     out_dir = Path(args.out_dir) if args.out_dir else ((work / "output") if limit else tag_dir / "holdout_output")
     out_dir.mkdir(parents=True, exist_ok=True)
     with log.stage("write outputs"):
-        cand_parts = []
-        for i, (country, cdf) in enumerate(eval_cands):
-            part = out_dir / f"_cands_part{i}.tsv"
-            ids_c = [s for s in eval_ids if s1_country.get(s, "") == country]
-            io_utils.write_id_lists(part, "candidate_entity_ids", ids_c, GroupedLists(cdf["s1_id"], cdf["s23_id"]))
-            cand_parts.append(part)
-        covered = {c for c, _ in eval_cands}
-        rest = [s for s in eval_ids if s1_country.get(s, "") not in covered]
-        if rest:
-            part = out_dir / "_cands_part_rest.tsv"
-            io_utils.write_id_lists(part, "candidate_entity_ids", rest, {})
-            cand_parts.append(part)
-        _concat_id_list_parts(cand_parts, out_dir / "candidate_pairs.tsv", "candidate_entity_ids")
-        for part in cand_parts:
-            part.unlink()
+        pieces = [(uni.ids_where(is_eval & (uni.s1_cc == k)), t) for k, t, _, _ in eval_tables]
+        _write_candidate_file(out_dir, pieces)
+        eval_ids = [s for ids, _ in pieces for s in ids]
         io_utils.write_id_lists(out_dir / "matching_results.tsv", "matched_entity_ids", eval_ids, matches)
         if data.s1_raw_for_tsv is not None:
             write_source_tsv(data.s1_raw_for_tsv, out_dir / "source1_slice.tsv")
 
     summary = {
         "date": _dt.datetime.now().isoformat(timespec="seconds"), "split": "train", "tag": tag,
-        "limit_s1": limit, "train_sample": len(sample_ids), "max_cands_per_source": args.max_cands_per_source,
-        "n_s1": len(all_s1), "n_holdout": len(report_ids), "n_cand_rows": n_cand_rows,
+        "limit_s1": limit, "train_sample": int(is_train.sum()), "max_cands_per_source": args.max_cands_per_source,
+        "n_s1": len(u1), "n_holdout": len(report_ids), "n_cand_rows": n_cand_rows,
         "n_train_rows": n_train_rows, "n_train_pos": n_pos, "train_seconds": train_seconds,
         "rounds": booster.current_iteration(), "decision_params": dataclasses.asdict(params_d),
-        "report": rep, "stages": log.stages, "total_seconds": log.total(), "peak_rss_gb": log.peak_gb(),
-        "out_dir": str(out_dir),
+        "n_scored_kept": len(scored), "report": rep, "stages": log.stages, "total_seconds": log.total(),
+        "peak_rss_gb": log.peak_gb(), "out_dir": str(out_dir),
     }
     (tag_dir / "run_summary.json").write_text(json.dumps(summary, indent=2, default=float), encoding="utf-8")
     return summary
@@ -764,8 +854,8 @@ def run_test(args, log: RunLog, slice_hook=None) -> dict:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     if args.baseline:
-        base_path = (Path(config.MODELS_DIR) / tag / "baseline.json") if limit else Path(config.MODELS_DIR) / "baseline.json"
-        if not base_path.exists():
+        base_path = Path(config.MODELS_DIR) / tag / "baseline.json"
+        if not limit or not base_path.exists():
             base_path = Path(config.MODELS_DIR) / "baseline.json"
         t_base = float(json.loads(base_path.read_text(encoding="utf-8"))["threshold"])
         log.msg(f"baseline threshold {t_base} from {base_path}")
@@ -776,45 +866,40 @@ def run_test(args, log: RunLog, slice_hook=None) -> dict:
         params_d = decide.DecisionParams(**json.loads(_decision_params_path(tag).read_text(encoding="utf-8")))
         tm = build_text_models(data, log)
         log.msg(f"model {tag}; decision params {params_d}")
+    uni = build_universe(data, log)
 
-    all_s1 = data.s1n["entity_id"].astype(str).tolist()
-    s1n_ctx_all = data.s1n[S1_CTX_COLS]
     matches: dict[str, list[str]] = {}
-    cand_parts = []
-    n_cand_rows = 0
-    n_scored = 0
-    with log.stage("score test" if not args.baseline else "baseline test"):
-        for i, (country, ids) in enumerate(_countries(data.s1n)):
-            df = order_and_trim(read_country_cands(data.cands_path, ids), args.max_cands_per_source)
-            n_cand_rows += len(df)
-            part = out_dir / f"_cands_part{i}.tsv"
-            io_utils.write_id_lists(part, "candidate_entity_ids", ids, GroupedLists(df["s1_id"], df["s23_id"]))
-            cand_parts.append(part)
-            if len(df) == 0:
+    pieces = []
+    n_cand_rows = n_scored = 0
+    with log.stage("baseline test" if args.baseline else "score test"):
+        for k, country in enumerate(uni.countries):
+            ids = uni.ids_where(uni.s1_cc == k)
+            t = order_and_trim(uni.cands.subset(uni.country_rows(k)), args.max_cands_per_source)
+            n_cand_rows += len(t)
+            pieces.append((ids, t))
+            if len(t) == 0:
                 log.msg(f"country {country!r}: {len(ids)} S1, no candidates")
                 continue
             if args.baseline:
-                top1 = top1_per_s1(df)
-                top1 = top1[top1["best_score"].to_numpy(dtype=np.float64) >= t_base]
-                matches.update({a: [b] for a, b in zip(top1["s1_id"].astype(str), top1["s23_id"].astype(str))})
-                log.msg(f"country {country}: {len(ids)} S1, {len(df)} candidates, {len(top1)} baseline matches")
-                del df
+                top1 = top1_per_s1(t)
+                top1 = top1[top1["best_score"].to_numpy() >= t_base]
+                matches.update({a: [b] for a, b in zip(top1["s1_id"], top1["s23_id"])})
+                log.msg(f"country {country!r}: {len(ids)} S1, {len(t)} candidates, {len(top1)} baseline matches")
                 continue
-            n_claim, rank_claim = claimant_features(df)
-            s1_ctx = s1n_ctx_all[s1n_ctx_all["country"].astype("string").fillna("") == country]
-            scored = _score_rows(df, n_claim, rank_claim, s1_ctx, data, tm, booster, cal)
+            n_claim, rank_claim = claimant_features(t)
+            scored = _score_rows(t, n_claim, rank_claim, _s1_ctx(data, country), data, tm, booster, cal)
             n_scored += len(scored)
-            del df, n_claim, rank_claim
+            del n_claim, rank_claim
             gc.collect()
             matches.update(decide.decide(scored, data.sib, params_d))
-            log.msg(f"country {country}: {len(ids)} S1, {n_cand_rows} cand rows so far, "
-                    f"{len(scored)} kept, {sum(1 for s in ids if matches.get(s))} S1 with matches")
+            log.msg(f"country {country!r}: {len(ids)} S1, {len(t)} candidates, {len(scored)} kept, "
+                    f"{sum(1 for s in ids if matches.get(s))} S1 with matches; rss={log.rss_gb():.1f}GB")
             del scored
             gc.collect()
+        uni.cands = None
     with log.stage("write outputs"):
-        _concat_id_list_parts(cand_parts, out_dir / "candidate_pairs.tsv", "candidate_entity_ids")
-        for part in cand_parts:
-            part.unlink()
+        _write_candidate_file(out_dir, pieces)
+        all_s1 = data.s1n["entity_id"].astype(str).tolist()
         io_utils.write_id_lists(out_dir / "matching_results.tsv", "matched_entity_ids", all_s1, matches)
         if data.s1_raw_for_tsv is not None:
             write_source_tsv(data.s1_raw_for_tsv, out_dir / "source1_slice.tsv")

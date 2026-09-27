@@ -1,7 +1,8 @@
 """End-to-end pipeline (SPEC section 6, Task 14).
 
     run_all.py --split {train,test} [--limit-s1 N] [--model-tag TAG]
-               [--train-sample 200000] [--max-cands-per-source K] [--baseline]
+               [--train-sample 200000] [--learning-rate 0.1] [--max-rounds 1500]
+               [--max-cands-per-source K] [--baseline]
                [--out-dir DIR]
     run_all.py --package
 
@@ -695,6 +696,51 @@ def _decision_params_path(tag: str) -> Path:
     return Path(config.MODELS_DIR) / tag / "decision_params.json"
 
 
+def _params_json(by_country: Mapping, default) -> str:
+    return json.dumps({"default": dataclasses.asdict(default),
+                       "by_country": {c: dataclasses.asdict(p) for c, p in sorted(by_country.items())}}, indent=2)
+
+
+def load_decision_params(text: str):
+    """(per-country params, default for other countries) from decision_params.json.
+    A flat v1 file (one setting) applies to every country."""
+    import decide
+
+    raw = json.loads(text)
+    if "default" not in raw:
+        return {}, decide.DecisionParams(**raw)
+    return ({c: decide.DecisionParams(**p) for c, p in raw["by_country"].items()},
+            decide.DecisionParams(**raw["default"]))
+
+
+def tune_by_country(scored: pd.DataFrame, sib: pd.DataFrame, truth: Mapping[str, set[str]],
+                    report_ids: Sequence[str], s1_country: Mapping[str, str]):
+    """Tune the decision layer separately per country on the holdout (candidate
+    lists never cross countries, so the one-owner rule is unaffected); countries
+    not in the holdout get the field-wise strictest setting."""
+    import decide
+
+    by_country = {}
+    row_country = scored["s1_id"].map(s1_country).to_numpy()
+    for country in sorted({s1_country[s] for s in report_ids}):
+        ids_c = [s for s in report_ids if s1_country[s] == country]
+        sc = scored[row_country == country].reset_index(drop=True)
+        by_country[country] = decide.tune(sc, sib, truth, ids_c)
+    return by_country, decide.conservative(by_country.values())
+
+
+def decide_by_country(scored: pd.DataFrame, sib: pd.DataFrame, s1_country: Mapping[str, str],
+                      by_country: Mapping, default) -> dict[str, list[str]]:
+    import decide
+
+    matches: dict[str, list[str]] = {}
+    row_country = scored["s1_id"].map(s1_country).to_numpy()
+    for country in pd.unique(row_country):
+        sc = scored[row_country == country].reset_index(drop=True)
+        matches.update(decide.decide(sc, sib, by_country.get(country, default)))
+    return matches
+
+
 def _in_sorted(keys: np.ndarray, sorted_keys: np.ndarray) -> np.ndarray:
     if len(sorted_keys) == 0:
         return np.zeros(len(keys), dtype=bool)
@@ -719,8 +765,6 @@ def _write_candidate_file(out_dir: Path, pieces: Sequence[tuple[list[str], CandC
 # ---------------------------------------------------------------------------
 
 def run_train(args, log: RunLog, slice_hook=None) -> dict:
-    import decide
-
     limit = args.limit_s1
     work = LIMIT_DIR / f"train_{limit}" if limit else None
     tag = args.model_tag or (f"limit{limit}" if limit else "v1")
@@ -809,9 +853,9 @@ def run_train(args, log: RunLog, slice_hook=None) -> dict:
         gc.collect()
         n_train_rows, n_pos = len(X), int(y.sum())
         log.msg(f"training rows {n_train_rows}, positives {n_pos}")
-        params = dict(train.LGB_PARAMS, learning_rate=LEARNING_RATE)
+        params = dict(train.LGB_PARAMS, learning_rate=args.learning_rate)
         t_train = time.time()
-        booster, oof = train.train_model(X, y, groups, max_rounds=MAX_ROUNDS, params=params)
+        booster, oof = train.train_model(X, y, groups, max_rounds=args.max_rounds, params=params)
         cal = train.fit_calibrator(oof, y)
         train_seconds = time.time() - t_train
         del X, y, groups, oof
@@ -832,13 +876,13 @@ def run_train(args, log: RunLog, slice_hook=None) -> dict:
 
     with log.stage("tune decision"):
         rep_scored = scored[scored["s1_id"].isin(report_set).to_numpy()].reset_index(drop=True)
-        params_d = decide.tune(rep_scored, data.sib, truth, report_ids)
-        del rep_scored
-        _decision_params_path(tag).write_text(json.dumps(dataclasses.asdict(params_d), indent=2), encoding="utf-8")
-        log.msg(f"decision params: {params_d}")
-    with log.stage("decide + report"):
-        matches = decide.decide(scored, data.sib, params_d)
         s1_country = dict(zip(u1.to_pylist(), [uni.countries[c] for c in uni.s1_cc]))
+        params_by_country, params_d = tune_by_country(rep_scored, data.sib, truth, report_ids, s1_country)
+        del rep_scored
+        _decision_params_path(tag).write_text(_params_json(params_by_country, params_d), encoding="utf-8")
+        log.msg(f"decision params: {params_by_country}; other countries {params_d}")
+    with log.stage("decide + report"):
+        matches = decide_by_country(scored, data.sib, s1_country, params_by_country, params_d)
         rep = evaluate.report({s: set(matches.get(s, ())) for s in report_ids}, truth,
                               {s: s1_country[s] for s in report_ids})
         rep["blocking_recall"] = blocking_recall
@@ -861,7 +905,10 @@ def run_train(args, log: RunLog, slice_hook=None) -> dict:
         "limit_s1": limit, "train_sample": int(is_train.sum()), "max_cands_per_source": args.max_cands_per_source,
         "n_s1": len(u1), "n_holdout": len(report_ids), "n_cand_rows": n_cand_rows,
         "n_train_rows": n_train_rows, "n_train_pos": n_pos, "train_seconds": train_seconds,
-        "rounds": booster.current_iteration(), "decision_params": dataclasses.asdict(params_d),
+        "learning_rate": args.learning_rate, "max_rounds": args.max_rounds,
+        "rounds": booster.current_iteration(),
+        "decision_params": {**{c: dataclasses.asdict(p) for c, p in params_by_country.items()},
+                            "default": dataclasses.asdict(params_d)},
         "n_scored_kept": len(scored), "report": rep, "stages": log.stages, "total_seconds": log.total(),
         "peak_rss_gb": log.peak_gb(), "out_dir": str(out_dir),
     }
@@ -894,9 +941,9 @@ def run_test(args, log: RunLog, slice_hook=None) -> dict:
         import decide
 
         booster, cal = train.load(tag)
-        params_d = decide.DecisionParams(**json.loads(_decision_params_path(tag).read_text(encoding="utf-8")))
+        params_by_country, params_d = load_decision_params(_decision_params_path(tag).read_text(encoding="utf-8"))
         tm = build_text_models(data, log)
-        log.msg(f"model {tag}; decision params {params_d}")
+        log.msg(f"model {tag}; decision params {params_by_country}; other countries {params_d}")
     uni = build_universe(data, log)
 
     matches: dict[str, list[str]] = {}
@@ -922,7 +969,7 @@ def run_test(args, log: RunLog, slice_hook=None) -> dict:
             n_scored += len(scored)
             del n_claim, rank_claim
             gc.collect()
-            matches.update(decide.decide(scored, data.sib, params_d))
+            matches.update(decide.decide(scored, data.sib, params_by_country.get(country, params_d)))
             log.msg(f"country {country!r}: {len(ids)} S1, {len(t)} candidates, {len(scored)} kept, "
                     f"{sum(1 for s in ids if matches.get(s))} S1 with matches; rss={log.rss_gb():.1f}GB")
             del scored
@@ -965,7 +1012,8 @@ def log_experiment(summary: dict, path: Path = EXPERIMENTS_MD) -> None:
             f"{r['baseline_macro_f05']:.4f}",
             f"- Decision params: {s['decision_params']}",
             f"- Training: {s['train_sample']} S1 sample, {s['n_train_rows']} rows ({s['n_train_pos']} positive), "
-            f"{s['rounds']} rounds, {s['train_seconds']:.0f} s (lr {LEARNING_RATE}, max_rounds {MAX_ROUNDS})",
+            f"{s['rounds']} rounds, {s['train_seconds']:.0f} s "
+            f"(lr {s.get('learning_rate', LEARNING_RATE)}, max_rounds {s.get('max_rounds', MAX_ROUNDS)})",
         ]
     else:
         lines += [f"- {s['n_s1']} S1, {s['n_cand_rows']} candidate pairs, {s['n_s1_with_matches']} S1 with matches"]
@@ -1025,6 +1073,8 @@ def parse_args(argv=None):
     ap.add_argument("--limit-s1", type=int, default=None)
     ap.add_argument("--model-tag", default=None)
     ap.add_argument("--train-sample", type=int, default=TRAIN_SAMPLE)
+    ap.add_argument("--learning-rate", type=float, default=LEARNING_RATE)
+    ap.add_argument("--max-rounds", type=int, default=MAX_ROUNDS)
     ap.add_argument("--max-cands-per-source", type=int, default=None)
     ap.add_argument("--baseline", action="store_true")
     ap.add_argument("--out-dir", default=None)
